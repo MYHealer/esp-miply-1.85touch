@@ -1,0 +1,48 @@
+# Build artifacts
+build/
+managed_components/
+dependencies.lock
+
+# ESP-IDF generated
+sdkconfig
+!sdkconfig.defaults
+!sdkconfig.defaults.esp32s3
+
+# Serial logs
+esp32_log.txt
+serial.log
+monitor_*.txt
+flash_*.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Reference projects (not part of the project)
+参考项目/
+
+# Node modules (font converter)
+node_modules/
+
+# Temporary test files
+cover_test.*
+font_chars.txt
+
+# Font source files (generated .c file is tracked)
+*.ttf
+*.ttc
+*.otf
+
+# Zip files
+*.zip
+
+# Temporary extraction directories
+temp_extract_*/
