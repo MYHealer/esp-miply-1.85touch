@@ -149,6 +149,7 @@ idf.py -p COM31 flash
 
 | 版本 | 日期 | 主要变更 |
 |------|------|----------|
+| v1.1 | 2026-09-05 | 补充字体(Latin Extended/韩文Jamo/CJK扩展A) + PSRAM栈崩溃修复 + README更新 |
 | v1.0 | 2026-09-05 | 初始版本：MiPlay + DLNA 双协议，360x360 触摸屏，PCM5101A 输出 |
 
 ## 许可证
