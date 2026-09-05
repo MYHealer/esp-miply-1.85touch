@@ -11,8 +11,13 @@ sdkconfig
 # Serial logs
 esp32_log.txt
 serial.log
+serial_log.txt
 monitor_*.txt
 flash_*.txt
+
+# Binary check tools
+check_*.bin
+capture_serial.py
 
 # Python
 __pycache__/

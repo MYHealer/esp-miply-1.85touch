@@ -1,0 +1,68 @@
+# Build artifacts
+build/
+managed_components/
+dependencies.lock
+
+# Third-party components (install via idf.py add-dependency or git submodules)
+components/lvgl/
+components/esp-adf-libs/
+components/esp_codec_dev/
+components/libwebp/
+components/gmf_audio/
+components/gmf_core/
+components/gmf_io/
+components/gmf_loader/
+components/cmake_utilities/
+components/esp_lcd_st77916/
+components/wifi_provision/
+components/idf6_compat/
+components/nghttp/
+components/mrbgems/
+components/mruby/
+components/urlparse/
+
+# Serial logs
+esp32_log.txt
+serial.log
+monitor_*.txt
+flash_*.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Reference projects (not part of the project)
+参考项目/
+
+# Node modules (font converter)
+node_modules/
+
+# Temporary test files
+cover_test.*
+font_chars.txt
+
+# Font source files (generated .c file is tracked)
+*.ttf
+*.ttc
+*.otf
+
+# Large generated resource files (>1MB, regenerate with lv_font_conv / img converter)
+components/lvgl_port/ui_ref/lv_font_simsun_16_cjk.c
+components/lvgl_port/ui_ref/ui_img_jiaopian_png.c
+components/lvgl_port/ui_img_jiaopian_png.c
+
+# Zip files
+*.zip
+
+# Temporary extraction directories
+temp_extract_*/
+*.png
+*.svg
