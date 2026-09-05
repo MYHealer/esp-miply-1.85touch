@@ -72,6 +72,10 @@ LV_IMG_DECLARE(ui_img_citou_png);
 LV_FONT_DECLARE(lv_font_simsun_16_cjk);
 LV_FONT_DECLARE(lv_font_simsun_16_supplement);
 
+/* RAM 可写副本（原字体是 const 在 flash，不能直接写 fallback 字段）*/
+static lv_font_t s_cjk_font;
+static lv_font_t s_supplement_font;
+
 /* Brookesia assets used by the copied system UI. */
 LV_FONT_DECLARE(esp_brookesia_font_maison_neue_book_12);
 LV_FONT_DECLARE(esp_brookesia_font_maison_neue_book_16);
@@ -1465,11 +1469,13 @@ void lvgl_port_ui_create(void)
     lv_obj_t *scr = lv_scr_act();
 
     s_wlan_ssid_font = esp_brookesia_font_maison_neue_book_22;
-    s_wlan_ssid_font.fallback = &lv_font_simsun_16_cjk;
+    s_wlan_ssid_font.fallback = &s_cjk_font;
 
-    /* CJK 字体 fallback 链：CJK → 补丁字体(拉丁扩展/韩文Jamo/注音等) */
-    lv_font_t *cjk = (lv_font_t *)&lv_font_simsun_16_cjk;
-    cjk->fallback = &lv_font_simsun_16_supplement;
+    /* CJK 字体 fallback 链：CJK(ram) → 补丁字体(ram) → Montserrat 12 */
+    s_cjk_font = lv_font_simsun_16_cjk;
+    s_supplement_font = lv_font_simsun_16_supplement;
+    s_supplement_font.fallback = &lv_font_montserrat_12;
+    s_cjk_font.fallback = &s_supplement_font;
 
     /* 关闭屏幕滚动条 */
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
@@ -1521,7 +1527,7 @@ void lvgl_port_ui_create(void)
     lv_obj_set_width(s_label_title, UI_SAFE_W);
     lv_label_set_text(s_label_title, "DLNA Player");
     lv_obj_set_style_text_color(s_label_title, C_WHITE, 0);
-    lv_obj_set_style_text_font(s_label_title, &lv_font_simsun_16_cjk, 0);
+    lv_obj_set_style_text_font(s_label_title, &s_cjk_font, 0);
     lv_label_set_long_mode(s_label_title, LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_obj_set_style_text_align(s_label_title, LV_TEXT_ALIGN_CENTER, 0);
 
@@ -1531,7 +1537,7 @@ void lvgl_port_ui_create(void)
     lv_obj_set_width(s_label_artist, UI_SAFE_W);
     lv_label_set_text(s_label_artist, "Waiting...");
     lv_obj_set_style_text_color(s_label_artist, C_WHITE80, 0);
-    lv_obj_set_style_text_font(s_label_artist, &lv_font_simsun_16_cjk, 0);
+    lv_obj_set_style_text_font(s_label_artist, &s_cjk_font, 0);
     lv_label_set_long_mode(s_label_artist, LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_obj_set_style_text_align(s_label_artist, LV_TEXT_ALIGN_CENTER, 0);
 
@@ -1646,7 +1652,7 @@ void lvgl_port_ui_lyrics_create(void)
     lv_obj_set_width(s_lyrics_placeholder, UI_SAFE_W);
     lv_obj_set_pos(s_lyrics_placeholder, UI_SAFE_X, 166);
     lv_label_set_text(s_lyrics_placeholder, "暂无歌词");
-    lv_obj_set_style_text_font(s_lyrics_placeholder, &lv_font_simsun_16_cjk, 0);
+    lv_obj_set_style_text_font(s_lyrics_placeholder, &s_cjk_font, 0);
     lv_obj_set_style_text_color(s_lyrics_placeholder, C_DIM, 0);
     lv_obj_set_style_text_align(s_lyrics_placeholder, LV_TEXT_ALIGN_CENTER, 0);
 
@@ -1655,7 +1661,7 @@ void lvgl_port_ui_lyrics_create(void)
     lv_obj_set_pos(s_lyrics_prev, UI_SAFE_X, 128);
     lv_obj_set_width(s_lyrics_prev, UI_SAFE_W);
     lv_label_set_text(s_lyrics_prev, "");
-    lv_obj_set_style_text_font(s_lyrics_prev, &lv_font_simsun_16_cjk, 0);
+    lv_obj_set_style_text_font(s_lyrics_prev, &s_cjk_font, 0);
     lv_obj_set_style_text_color(s_lyrics_prev, C_DIM, 0);
     lv_obj_set_style_text_align(s_lyrics_prev, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_lyrics_prev, LV_LABEL_LONG_CLIP);
@@ -1665,7 +1671,7 @@ void lvgl_port_ui_lyrics_create(void)
     lv_obj_set_pos(s_lyrics_curr, UI_SAFE_X, 168);
     lv_obj_set_width(s_lyrics_curr, UI_SAFE_W);
     lv_label_set_text(s_lyrics_curr, "");
-    lv_obj_set_style_text_font(s_lyrics_curr, &lv_font_simsun_16_cjk, 0);
+    lv_obj_set_style_text_font(s_lyrics_curr, &s_cjk_font, 0);
     lv_obj_set_style_text_color(s_lyrics_curr, C_DIM, 0);
     lv_obj_set_style_text_color(s_lyrics_curr, C_ACCENT, LV_PART_SELECTED);
     lv_obj_set_style_bg_color(s_lyrics_curr, C_BG_TOP, LV_PART_SELECTED);
@@ -1678,7 +1684,7 @@ void lvgl_port_ui_lyrics_create(void)
     lv_obj_set_pos(s_lyrics_next, UI_SAFE_X, 208);
     lv_obj_set_width(s_lyrics_next, UI_SAFE_W);
     lv_label_set_text(s_lyrics_next, "");
-    lv_obj_set_style_text_font(s_lyrics_next, &lv_font_simsun_16_cjk, 0);
+    lv_obj_set_style_text_font(s_lyrics_next, &s_cjk_font, 0);
     lv_obj_set_style_text_color(s_lyrics_next, C_DIM, 0);
     lv_obj_set_style_text_align(s_lyrics_next, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_lyrics_next, LV_LABEL_LONG_CLIP);
