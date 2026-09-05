@@ -235,17 +235,10 @@ esp_err_t lvgl_port_touch_init(lv_display_t *disp)
     lv_indev_set_display(s_touch_indev, disp);
     lv_indev_set_read_cb(s_touch_indev, touch_read);
 
-    /* 必须绑核 0：核 1 被 MiPlay media task 占满，绑核 1 会被饿死（触摸零响应）。
-     * 同类教训见按钮任务 dlna 项目记录。 */
-    BaseType_t task_ret = xTaskCreatePinnedToCoreWithCaps(
+    /* 内部 SRAM 栈（PSRAM 栈 + flash 操作 = 断言崩溃）*/
+    BaseType_t task_ret = xTaskCreatePinnedToCore(
         touch_sample_task, "touch_sample", TOUCH_SAMPLE_STACK_BYTES, NULL, 5,
-        &s_touch_task, 0, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (task_ret != pdPASS) {
-        ESP_LOGW(TAG, "CST816S PSRAM stack create failed; trying internal stack");
-        task_ret = xTaskCreatePinnedToCore(touch_sample_task, "touch_sample",
-                                           TOUCH_SAMPLE_STACK_BYTES, NULL, 5,
-                                           &s_touch_task, 0);
-    }
+        &s_touch_task, 0);
     if (task_ret != pdPASS) {
         ESP_LOGE(TAG, "CST816S sampling task creation failed");
         return ESP_ERR_NO_MEM;

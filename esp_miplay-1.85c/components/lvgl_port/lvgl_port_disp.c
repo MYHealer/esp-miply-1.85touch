@@ -93,16 +93,10 @@ esp_err_t lvgl_port_init(int task_priority)
     /* 创建 UI */
     lvgl_port_ui_create();
 
-    /* 创建 LVGL 处理任务 */
-    BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(
+    /* 内部 SRAM 栈（PSRAM 栈 + flash 操作 = 断言崩溃）*/
+    BaseType_t ret = xTaskCreatePinnedToCore(
         lvgl_tick_task, "lvgl_tick", LVGL_TASK_STACK_BYTES, NULL,
-        task_priority, NULL, 0, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (ret != pdPASS) {
-        ESP_LOGW(TAG, "lvgl_tick_task PSRAM stack create failed; trying internal stack");
-        ret = xTaskCreatePinnedToCore(lvgl_tick_task, "lvgl_tick",
-                                      LVGL_TASK_STACK_BYTES, NULL,
-                                      task_priority, NULL, 0);
-    }
+        task_priority, NULL, 0);
     if (ret != pdPASS) ESP_LOGE(TAG, "lvgl_tick_task create FAILED (heap=%d)", esp_get_free_heap_size());
     else ESP_LOGI(TAG, "lvgl_tick_task created OK");
 

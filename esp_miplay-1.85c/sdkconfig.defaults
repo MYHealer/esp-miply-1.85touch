@@ -15,11 +15,15 @@ CONFIG_SPIRAM=y
 CONFIG_SPIRAM_BOOT_INIT=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_SPEED_80M=y
-CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+# PSRAM 栈 + SPI Flash 共用 cache 总线：PSRAM 栈的 task 做 flash 操作时
+# spi_flash_disable_interrupts_caches_and_other_cpu() 关 cache → PSRAM 不可访问
+# → esp_task_stack_is_sane_cache_disabled() 断言崩溃。禁用 PSRAM 栈规避。
+# CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY is not set
 # Keep Wi-Fi/LwIP RX control blocks in internal RAM. MiPlay decoding heavily
 # uses PSRAM, and corrupting an external-RAM pbuf crashes in wifi_free().
 # CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP is not set
-CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+# 禁用 PSRAM 栈后，原来放 PSRAM 的 lvgl/touch/audio 栈全部走内部 SRAM，保留 64KB
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 # 小对象（<=512 字节）留内部 DRAM，更大的 malloc 去 PSRAM
 # semaphore / DMA 描述符仍远小于 512；512-1024 的缓冲不再挤内部堆
