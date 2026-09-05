@@ -106,9 +106,11 @@ esp_codec_dev_handle_t audio_out_init(void)
         goto error;
     }
 
+    i2s_channel_enable(s_tx_handle);
+
     s_initialized = true;
-    s_output_enabled = false;
-    s_output_paused = true;
+    s_output_enabled = true;
+    s_output_paused = false;
     s_current_rate = sample_info.sample_rate;
     s_current_ch = sample_info.channel;
     s_current_bits = sample_info.bits_per_sample;
@@ -201,11 +203,11 @@ bool audio_out_is_paused(void)
 
 void audio_out_set_clk(esp_codec_dev_handle_t dev, int rate, int ch, int bits)
 {
-    if (!s_initialized || s_codec_dev == NULL) {
-        ESP_LOGW(TAG, "Codec not ready, skip clock reconfiguration");
+    (void)dev;
+    if (!s_initialized || !s_tx_handle) {
+        ESP_LOGW(TAG, "I2S not ready, skip clock reconfiguration");
         return;
     }
-    dev = (dev == s_codec_dev) ? dev : s_codec_dev;
     int target_ch = ch < 2 ? 1 : 2;
 
     if (s_audio_mux) xSemaphoreTake(s_audio_mux, portMAX_DELAY);
@@ -214,6 +216,10 @@ void audio_out_set_clk(esp_codec_dev_handle_t dev, int rate, int ch, int bits)
         if (s_audio_mux) xSemaphoreGive(s_audio_mux);
         return;
     }
+
+    /* 禁用通道 → 重配时钟/时隙 → 重新启用（原子操作）
+     * 直接操作 I2S 驱动 API，不走 esp_codec_dev（PCM5101A 无控制接口，
+     * codec_if=NULL 时 close/open 不会触发 I2S 硬件重配） */
     bool restore_output = s_output_enabled && !s_output_paused;
     if (s_output_enabled) {
         esp_err_t disable_ret = i2s_channel_disable(s_tx_handle);
@@ -224,24 +230,32 @@ void audio_out_set_clk(esp_codec_dev_handle_t dev, int rate, int ch, int bits)
         s_output_enabled = false;
     }
 
-    esp_codec_dev_sample_info_t sample_info = {
-        .sample_rate = rate,
-        .channel = target_ch,
-        .bits_per_sample = bits,
-    };
-    int ret = esp_codec_dev_close(dev);
-    if (ret != ESP_CODEC_DEV_OK) {
-        ESP_LOGE(TAG, "Close codec before reconfiguration failed: %d", ret);
+    i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(rate);
+    if (bits == 24) {
+        clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384;
     }
-    ret = esp_codec_dev_open(dev, &sample_info);
-    if (ret != ESP_CODEC_DEV_OK) {
-        ESP_LOGE(TAG, "Open codec at %d Hz failed: %d", rate, ret);
-        if (s_audio_mux) xSemaphoreGive(s_audio_mux);
-        return;
+    esp_err_t ret = i2s_channel_reconfig_std_clock(s_tx_handle, &clk_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "reconfig_std_clock(%d) failed: %s", rate, esp_err_to_name(ret));
     }
-    s_current_rate = sample_info.sample_rate;
-    s_current_ch = sample_info.channel;
-    s_current_bits = sample_info.bits_per_sample;
+
+    i2s_data_bit_width_t bit_w;
+    switch (bits) {
+        case 24: bit_w = I2S_DATA_BIT_WIDTH_24BIT; break;
+        case 32: bit_w = I2S_DATA_BIT_WIDTH_32BIT; break;
+        default: bit_w = I2S_DATA_BIT_WIDTH_16BIT; break;
+    }
+    i2s_slot_mode_t slot_mode = (target_ch <= 1) ? I2S_SLOT_MODE_MONO : I2S_SLOT_MODE_STEREO;
+    i2s_std_slot_config_t slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(bit_w, slot_mode);
+    ret = i2s_channel_reconfig_std_slot(s_tx_handle, &slot_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "reconfig_std_slot failed: %s", esp_err_to_name(ret));
+    }
+
+    s_current_rate = rate;
+    s_current_ch = target_ch;
+    s_current_bits = bits;
+
     if (restore_output && !s_output_paused) {
         esp_err_t enable_ret = i2s_channel_enable(s_tx_handle);
         if (enable_ret == ESP_OK || enable_ret == ESP_ERR_INVALID_STATE) {
@@ -252,6 +266,6 @@ void audio_out_set_clk(esp_codec_dev_handle_t dev, int rate, int ch, int bits)
                      esp_err_to_name(enable_ret));
         }
     }
-    ESP_LOGI(TAG, "PCM5101A reconfigured: %d Hz %d bit %d ch", rate, bits, ch);
+    ESP_LOGI(TAG, "I2S reconfig: %d Hz, %d bit, %d ch", rate, bits, ch);
     if (s_audio_mux) xSemaphoreGive(s_audio_mux);
 }

@@ -17,6 +17,7 @@
 #include "esp_gmf_pool.h"
 #include "esp_gmf_io_http.h"
 #include "esp_gmf_io_codec_dev.h"
+#include "esp_gmf_io_miplay.h"
 #include "esp_gmf_audio_dec.h"
 #include "esp_gmf_alc.h"
 #include "esp_gmf_event.h"
@@ -30,6 +31,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "freertos/event_groups.h"
+#include "freertos/ringbuf.h"
 #include "driver/gpio.h"
 #include "echopal_board.h"
 #include "tft_display.h"
@@ -73,6 +75,12 @@ static esp_gmf_element_handle_t  s_dec_el     = NULL;
 static esp_gmf_element_handle_t  s_alc_el     = NULL;
 static esp_gmf_pool_handle_t     s_pool       = NULL;
 
+/* MiPlay GMF 管线：io_miplay → aud_dec → aud_alc → io_codec_dev */
+static esp_gmf_pipeline_handle_t s_miplay_pipe  = NULL;
+static esp_gmf_task_handle_t     s_miplay_task  = NULL;
+static esp_gmf_element_handle_t  s_miplay_alc_el = NULL;
+static RingbufHandle_t           s_ts_ringbuf    = NULL;
+
 static SemaphoreHandle_t s_state_mux     = NULL;
 static play_state_t  s_state             = PS_STOPPED;
 static char         *s_track_uri         = NULL;
@@ -89,9 +97,6 @@ static char         *s_saved_uri         = NULL;
 static unsigned long s_music_id          = 0;   /* 当前歌曲 ID，用于检测音质切换 */
 /* 用于 GENA 去抖：相同状态不重复 notify */
 static play_state_t  s_last_notified     = PS_STOPPED;
-/* 宽限期：play() 后 8 秒内不被轮询覆盖 PLAYING 状态 */
-static int64_t       s_grace_until       = 0;
-/* Next URI 预设 */
 static char         *s_next_uri          = NULL;
 static char         *s_next_metadata     = NULL;
 /* 用户主动停止标志 */
@@ -112,7 +117,7 @@ static EXT_RAM_BSS_ATTR miplay_media_event_t s_miplay_media_event_work;
 static EXT_RAM_BSS_ATTR miplay_media_event_t s_miplay_media_drop_work;
 static volatile bool s_miplay_connected = false;
 static volatile bool s_miplay_session_reset_pending = false;
-static int s_miplay_state = PS_STOPPED;
+static volatile int s_miplay_state = PS_STOPPED;  /* MiPlay 反控状态镜像，跨任务读写 */
 static int s_miplay_position_ms = 0;
 static int s_miplay_duration_ms = 0;
 static int64_t s_miplay_position_anchor_us = 0;
@@ -122,9 +127,30 @@ static EXT_RAM_BSS_ATTR char s_miplay_title[128];
 static EXT_RAM_BSS_ATTR char s_miplay_artist[128];
 static EXT_RAM_BSS_ATTR char s_miplay_album[128];
 static EXT_RAM_BSS_ATTR char s_miplay_cover_url[MIPLAY_COVER_SOURCE_MAX];
-/* 位置追踪：纯软件方案（参考 miair-next） */
+/* 位置追踪：纯软件方案（参考 miair-next）
+ * s_play_start_us / s_grace_until 是 int64_t，32 位 MCU 上读写为两条指令，
+ * 会被更高优先级任务抢占撕裂（高低半字混合 → 进度计算荒谬）。
+ * 必须通过 pos_* 访问器在临界区内读写。 */
 static int64_t        s_play_start_us     = 0;   /* 播放开始时间（esp_timer us），0=未在播放 */
+static int64_t        s_grace_until       = 0;   /* 宽限期截止（esp_timer us） */
 static int            s_accumulated_ms    = 0;   /* 累计已播放 ms（暂停/停止时冻结） */
+
+static portMUX_TYPE s_pos_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static inline int64_t pos_load_i64(int64_t *v)
+{
+    portENTER_CRITICAL(&s_pos_mux);
+    int64_t r = *v;
+    portEXIT_CRITICAL(&s_pos_mux);
+    return r;
+}
+
+static inline void pos_store_i64(int64_t *v, int64_t val)
+{
+    portENTER_CRITICAL(&s_pos_mux);
+    *v = val;
+    portEXIT_CRITICAL(&s_pos_mux);
+}
 static char          *s_playing_uri       = NULL; /* 当前音频管道实际加载的 URI，用于检测暂停时切歌 */
 /* 主动播完检测（参考 miair-next _check_play_status）：
  * 软件位置接近曲末但底层未触发 FINISHED 时的兜底，避免控制器等不到 STOPPED 不切歌 */
@@ -226,6 +252,12 @@ static void cb_next(void);
 static void cb_previous(void);
 static void cb_play_toggle(void);
 static void dlna_on_miplay_media(const miplay_media_event_t *event);
+static void dlna_on_miplay_media_start(bool start);
+static void on_miplay_vol_changed(uint32_t vol_percent);
+static void miplay_pipeline_init(void);
+static void miplay_pipeline_start(void);
+static void miplay_pipeline_stop(void);
+static esp_gmf_err_t miplay_pipeline_event_cb(esp_gmf_event_pkt_t *event, void *ctx);
 static void fetch_album_art_async(const char *url);
 
 static void schedule_delayed_stop_notify(void)
@@ -256,8 +288,8 @@ static esp_gmf_err_t pipeline_event_cb(esp_gmf_event_pkt_t *event, void *ctx)
         switch (st) {
             case ESP_GMF_EVENT_STATE_RUNNING:
                 set_state(PS_PLAYING);
-                if (s_play_start_us == 0) {
-                    s_play_start_us = esp_timer_get_time();
+                if (pos_load_i64(&s_play_start_us) == 0) {
+                    pos_store_i64(&s_play_start_us, esp_timer_get_time());
                 }
                 break;
             case ESP_GMF_EVENT_STATE_PAUSED:
@@ -265,7 +297,7 @@ static esp_gmf_err_t pipeline_event_cb(esp_gmf_event_pkt_t *event, void *ctx)
                 break;
             case ESP_GMF_EVENT_STATE_STOPPED:
                 /* Grace 保护期内忽略降级事件（旧管线的残留事件） */
-                if (esp_timer_get_time() < s_grace_until) {
+                if (esp_timer_get_time() < pos_load_i64(&s_grace_until)) {
                     ESP_LOGD(TAG, "STOPPED ignored (grace period)");
                     break;
                 }
@@ -285,7 +317,7 @@ static esp_gmf_err_t pipeline_event_cb(esp_gmf_event_pkt_t *event, void *ctx)
                 schedule_delayed_stop_notify();
                 break;
             case ESP_GMF_EVENT_STATE_ERROR:
-                if (esp_timer_get_time() < s_grace_until) {
+                if (esp_timer_get_time() < pos_load_i64(&s_grace_until)) {
                     ESP_LOGD(TAG, "ERROR ignored (grace period)");
                     break;
                 }
@@ -335,8 +367,8 @@ static const char *cb_get_uri(void)             { return s_track_uri ? s_track_u
 
 static int cb_get_position_sec(void)
 {
-    if (get_state() == PS_PLAYING && s_play_start_us > 0) {
-        int elapsed_ms = (int)((esp_timer_get_time() - s_play_start_us) / 1000LL);
+    if (get_state() == PS_PLAYING && pos_load_i64(&s_play_start_us) > 0) {
+        int elapsed_ms = (int)((esp_timer_get_time() - pos_load_i64(&s_play_start_us)) / 1000LL);
         return (s_accumulated_ms + elapsed_ms) / 1000;
     }
     return s_accumulated_ms / 1000;
@@ -344,8 +376,8 @@ static int cb_get_position_sec(void)
 
 static int cb_get_position_ms(void)
 {
-    if (get_state() == PS_PLAYING && s_play_start_us > 0) {
-        int elapsed_ms = (int)((esp_timer_get_time() - s_play_start_us) / 1000LL);
+    if (get_state() == PS_PLAYING && pos_load_i64(&s_play_start_us) > 0) {
+        int elapsed_ms = (int)((esp_timer_get_time() - pos_load_i64(&s_play_start_us)) / 1000LL);
         return s_accumulated_ms + elapsed_ms;
     }
     return s_accumulated_ms;
@@ -443,10 +475,12 @@ static void parse_duration_from_metadata(const char *meta)
 
 static int cb_get_duration_sec(void)
 {
-    play_state_t st = get_state();
-    if (st == PS_STOPPED || st == PS_NO_MEDIA) return 0;
-    /* 优先返回从 metadata 解析的时长（准确），
+    /* 只有无媒体时才返回 0；STOPPED 时保留 metadata 时长
+     * （网易云 Stop→SetURI→Play 连发，轮询落在 STOPPED 间隙会误报 0）
+     * 优先返回从 metadata 解析的时长（准确），
      * 不再依赖 esp_audio_duration_get（返回的是解码累计时间，不是歌曲时长） */
+    play_state_t st = get_state();
+    if (st == PS_NO_MEDIA) return 0;
     return s_dur_cache_sec;
 }
 
@@ -741,6 +775,46 @@ static void dlna_on_miplay_media(const miplay_media_event_t *event)
     }
 }
 
+/* MiPlay 媒体流开始/停止 → 启动/停止 GMF 管线（由 miplay 组件回调） */
+static void dlna_on_miplay_media_start(bool start)
+{
+    if (start) {
+        ESP_LOGW(TAG, "=== MiPlay media started → starting GMF pipeline ===");
+        /* 新歌从 0 累计 */
+        s_accumulated_ms = 0;
+        pos_store_i64(&s_play_start_us, 0);
+        miplay_pipeline_start();
+        /* 管线起来后立刻把手机当前音量打到 ALC（NVS 恢复值或会话值） */
+        on_miplay_vol_changed(miplay_get_volume());
+    } else {
+        ESP_LOGW(TAG, "=== MiPlay media stopped → stopping GMF pipeline ===");
+        /* 冻结累计并复位起点 */
+        if (pos_load_i64(&s_play_start_us) > 0) {
+            s_accumulated_ms += (int)((esp_timer_get_time() - pos_load_i64(&s_play_start_us)) / 1000LL);
+            pos_store_i64(&s_play_start_us, 0);
+        }
+        miplay_pipeline_stop();
+    }
+}
+
+/* ── MiPlay 手机端音量变化 → 同步到 MiPlay 管线 ALC ──
+ * 统一 GMF 后音量不再在 PCM 采样上软件相乘，
+ * 改为 aud_alc 增益控制（与 DLNA 管线 _my_vol_set 同一条平方曲线）。 */
+static void on_miplay_vol_changed(uint32_t vol_percent)
+{
+    if (!s_miplay_alc_el) return;
+    int alc_gain;
+    if (vol_percent <= 0) {
+        alc_gain = -64;
+    } else {
+        int diff = 100 - (int)vol_percent;
+        alc_gain = -(diff * diff * 30) / 10000;
+        if (alc_gain < -64) alc_gain = -64;
+    }
+    esp_gmf_alc_set_gain_all(s_miplay_alc_el, (int8_t)alc_gain);
+    ESP_LOGI(TAG, "[MiPlay] Vol %lu%% → ALC gain %d", (unsigned long)vol_percent, alc_gain);
+}
+
 static void cb_set_uri(const char *uri)
 {
     s_media_generation++;
@@ -797,9 +871,9 @@ static void delayed_stop_notify(void *arg)
     }
 
     /* 冻结最终位置 */
-    if (s_play_start_us > 0) {
-        s_accumulated_ms += (int)((esp_timer_get_time() - s_play_start_us) / 1000LL);
-        s_play_start_us = 0;
+    if (pos_load_i64(&s_play_start_us) > 0) {
+        s_accumulated_ms += (int)((esp_timer_get_time() - pos_load_i64(&s_play_start_us)) / 1000LL);
+        pos_store_i64(&s_play_start_us, 0);
     }
 
     cb_next();
@@ -856,8 +930,8 @@ static void _do_play(const char *uri, int seek_sec)
     if (err == ESP_GMF_ERR_OK) {
         set_state(PS_PLAYING);
         s_accumulated_ms = seek_sec * 1000;
-        s_play_start_us = esp_timer_get_time();
-        s_grace_until = esp_timer_get_time() + 8000000LL;
+        pos_store_i64(&s_play_start_us, esp_timer_get_time());
+        pos_store_i64(&s_grace_until, esp_timer_get_time() + 8000000LL);
         s_user_stopped = 0;
         free(s_playing_uri);
         s_playing_uri = strdup(uri);
@@ -873,15 +947,28 @@ static void _do_play(const char *uri, int seek_sec)
     }
 }
 
+/* DLNA SOAP 动作到达 = 手机在用 DLNA 投屏 = 必须脱离 MiPlay 模式。
+ * MiPlay App 退出时常不发 disconnect 事件，s_miplay_connected 残留 true，
+ * cb_play 被劫持到 receiver-control 分支（会话已死，静默丢弃）→
+ * DLNA 管线永不启动 → 无声 + 进度/时长恒 0。 */
+static void dlna_detach_miplay_if_active(void)
+{
+    if (!s_miplay_connected) return;
+    ESP_LOGW(TAG, "DLNA SOAP received while MiPlay mode → detaching MiPlay");
+    s_miplay_connected = false;
+    s_miplay_state = PS_STOPPED;
+    s_miplay_position_anchor_us = 0;
+    miplay_pipeline_stop();
+    custom_dlna_set_ssdp_suppressed(false);
+    /* 重置 I2S 跟踪，DLNA 播放时强制重配时钟 */
+    s_last_i2s_rate = 0;
+    s_last_i2s_bits = 0;
+    s_last_i2s_ch   = 0;
+}
+
 static void cb_play(void)
 {
-    if (s_miplay_connected) {
-        miplay_send_receiver_control("resume", 0);
-        s_miplay_state = PS_PLAYING;
-        s_miplay_position_anchor_us = esp_timer_get_time();
-        ESP_LOGI(TAG, "MiPlay: resume requested");
-        return;
-    }
+    dlna_detach_miplay_if_active();
     play_state_t cur = get_state();
     ESP_LOGI(TAG, "Play (state=%d, saved_uri=%s, saved_pos=%d)",
              cur, s_saved_uri ? s_saved_uri : "(null)", s_saved_pos_sec);
@@ -894,7 +981,7 @@ static void cb_play(void)
         }
         ESP_LOGI(TAG, "Play while playing, new URL, switching (saved_pos=%d)", s_saved_pos_sec);
         s_user_stopped = 0;
-        s_grace_until = esp_timer_get_time() + 1500000LL;
+        pos_store_i64(&s_grace_until, esp_timer_get_time() + 1500000LL);
         esp_gmf_pipeline_stop(s_pipe);
         vTaskDelay(pdMS_TO_TICKS(1000));
         _do_play(s_track_uri, s_saved_pos_sec);
@@ -909,7 +996,7 @@ static void cb_play(void)
         if (uri_changed) {
             ESP_LOGI(TAG, "URI changed while paused, switching to new track (saved_pos=%d)", s_saved_pos_sec);
             s_user_stopped = 0;
-            s_grace_until = esp_timer_get_time() + 1500000LL;
+            pos_store_i64(&s_grace_until, esp_timer_get_time() + 1500000LL);
             esp_gmf_pipeline_stop(s_pipe);
             vTaskDelay(pdMS_TO_TICKS(1000));
             _do_play(s_track_uri, s_saved_pos_sec);
@@ -918,10 +1005,10 @@ static void cb_play(void)
             /* 同 URI 恢复暂停 */
             esp_gmf_pipeline_resume(s_pipe);
             set_state(PS_PLAYING);
-            s_play_start_us = esp_timer_get_time();
+            pos_store_i64(&s_play_start_us, esp_timer_get_time());
             ESP_LOGI(TAG, "Resumed from pause (pos=%d ms)", s_accumulated_ms);
         }
-        s_grace_until = esp_timer_get_time() + 8000000LL;
+        pos_store_i64(&s_grace_until, esp_timer_get_time() + 8000000LL);
         s_user_stopped = 0;
         return;
     }
@@ -938,21 +1025,14 @@ static void cb_play(void)
 
 static void cb_pause(void)
 {
-    if (s_miplay_connected) {
-        s_miplay_position_ms = get_miplay_position_ms();
-        s_miplay_position_anchor_us = 0;
-        s_miplay_state = PS_PAUSED;
-        miplay_send_receiver_control("pause", 0);
-        ESP_LOGI(TAG, "MiPlay: pause requested at %d ms", s_miplay_position_ms);
-        return;
-    }
+    dlna_detach_miplay_if_active();
     play_state_t cur = get_state();
     ESP_LOGI(TAG, "Pause (state=%d)", cur);
     if (s_pipe && cur == PS_PLAYING) {
         /* 冻结累计播放时间 */
-        if (s_play_start_us > 0) {
-            s_accumulated_ms += (int)((esp_timer_get_time() - s_play_start_us) / 1000LL);
-            s_play_start_us = 0;
+        if (pos_load_i64(&s_play_start_us) > 0) {
+            s_accumulated_ms += (int)((esp_timer_get_time() - pos_load_i64(&s_play_start_us)) / 1000LL);
+            pos_store_i64(&s_play_start_us, 0);
         }
         s_saved_pos_sec = s_accumulated_ms / 1000;
         free(s_saved_uri);
@@ -967,11 +1047,6 @@ static void cb_pause(void)
 /* ── 播放/暂停切换 ── */
 static void cb_play_toggle(void)
 {
-    if (s_miplay_connected) {
-        if (s_miplay_state == PS_PLAYING) cb_pause();
-        else cb_play();
-        return;
-    }
     play_state_t cur = get_state();
     if (cur == PS_PLAYING) {
         cb_pause();
@@ -997,9 +1072,9 @@ static void cb_stop(void)
     }
 
     /* 冻结累计播放时间 */
-    if (s_play_start_us > 0) {
-        s_accumulated_ms += (int)((esp_timer_get_time() - s_play_start_us) / 1000LL);
-        s_play_start_us = 0;
+    if (pos_load_i64(&s_play_start_us) > 0) {
+        s_accumulated_ms += (int)((esp_timer_get_time() - pos_load_i64(&s_play_start_us)) / 1000LL);
+        pos_store_i64(&s_play_start_us, 0);
     }
     s_saved_pos_sec = s_accumulated_ms / 1000;
     free(s_saved_uri);
@@ -1007,7 +1082,7 @@ static void cb_stop(void)
     s_user_stopped = 1;
     /* 宽限期：抑制 pipeline_stop 触发的中间 STOPPED 事件
      * 网易云流程: Stop → SetAVTransportURI → Play，可能间隔很短 */
-    s_grace_until = esp_timer_get_time() + 2000000LL;
+    pos_store_i64(&s_grace_until, esp_timer_get_time() + 2000000LL);
     if (s_pipe) esp_gmf_pipeline_stop(s_pipe);
     set_state(PS_STOPPED);
     free(s_next_uri); s_next_uri = NULL;
@@ -1018,13 +1093,7 @@ static void cb_stop(void)
 /* ── Seek：拖动进度条 ── */
 static void cb_seek(int seconds)
 {
-    if (s_miplay_connected) {
-        s_miplay_position_ms = seconds > 0 ? seconds * 1000 : 0;
-        s_miplay_position_anchor_us = s_miplay_state == PS_PLAYING ? esp_timer_get_time() : 0;
-        miplay_send_receiver_control("seek", (int64_t)s_miplay_position_ms);
-        ESP_LOGI(TAG, "MiPlay: seek requested %d ms", s_miplay_position_ms);
-        return;
-    }
+    dlna_detach_miplay_if_active();
     s_media_generation++;
     s_near_end_count = 0;
     ESP_LOGI(TAG, "Seek %d s (dur=%d)", seconds, s_dur_cache_sec);
@@ -1062,7 +1131,7 @@ static void cb_seek(int seconds)
 
     /* 更新位置追踪 */
     s_accumulated_ms = seconds * 1000;
-    s_play_start_us = esp_timer_get_time();
+    pos_store_i64(&s_play_start_us, esp_timer_get_time());
 
     if (was_playing) {
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -1112,22 +1181,11 @@ static bool is_video_uri(const char *uri)
 
 /* Next — 严格对齐 miair-next next_track() 流程 */
 static void cb_next(void) {
-    if (s_miplay_connected) {
-        static int64_t s_last_next_us;
-        int64_t now = esp_timer_get_time();
-        if (now - s_last_next_us < 800000LL) {
-            ESP_LOGI(TAG, "MiPlay: next debounced");
-            return;
-        }
-        s_last_next_us = now;
-        miplay_send_receiver_control("next", 0);
-        ESP_LOGI(TAG, "MiPlay: next requested");
-        return;
-    }
+    dlna_detach_miplay_if_active();
     ESP_LOGI(TAG, "Next (next_uri=%s) state=%d", s_next_uri ? s_next_uri : "(null)", (int)get_state());
     s_user_stopped = 0;
     s_accumulated_ms = 0;
-    s_play_start_us = 0;
+    pos_store_i64(&s_play_start_us, 0);
     s_saved_pos_sec = 0;
     free(s_saved_uri); s_saved_uri = NULL;
     s_near_end_count = 0;
@@ -1137,7 +1195,7 @@ static void cb_next(void) {
         /* ── 有 next_uri：stop → sleep 1.0s → promote → play ── */
         /* 设置宽限期，抑制 pipeline_stop 触发的中间 STOPPED 事件通知控制器
          * （参考项目 notify_state_change() 只在最终状态后调用） */
-        s_grace_until = esp_timer_get_time() + 1500000LL;
+        pos_store_i64(&s_grace_until, esp_timer_get_time() + 1500000LL);
         if (s_pipe) {
             esp_gmf_pipeline_stop(s_pipe);
         }
@@ -1161,7 +1219,7 @@ static void cb_next(void) {
         /* ── 无 next_uri：TRANSITIONING 等待手机下发 SetNextAVTransportURI ──
          * QQ 音乐切歌前会先发 SetNextAVTransportURI，但可能延迟。
          * 设 TRANSITIONING 触发 UPnP 事件唤醒手机，最多等 10s。 */
-        s_grace_until = esp_timer_get_time() + 1000000LL;
+        pos_store_i64(&s_grace_until, esp_timer_get_time() + 1000000LL);
         if (s_pipe) {
             esp_gmf_pipeline_stop(s_pipe);
         }
@@ -1205,7 +1263,7 @@ static void cb_next(void) {
             if (s_dur_cache_sec > 0) {
                 s_accumulated_ms = s_dur_cache_sec * 1000;
             }
-            s_play_start_us = 0;
+            pos_store_i64(&s_play_start_us, 0);
             set_state(PS_STOPPED);
             custom_dlna_update_uri(NULL, NULL);
             ESP_LOGI(TAG, "TRANSITIONING: timeout, stopped");
@@ -1214,28 +1272,17 @@ static void cb_next(void) {
     custom_dlna_notify_transport_state_async();
 }
 static void cb_previous(void) {
-    if (s_miplay_connected) {
-        static int64_t s_last_prev_us;
-        int64_t now = esp_timer_get_time();
-        if (now - s_last_prev_us < 800000LL) {
-            ESP_LOGI(TAG, "MiPlay: previous debounced");
-            return;
-        }
-        s_last_prev_us = now;
-        miplay_send_receiver_control("prev", 0);
-        ESP_LOGI(TAG, "MiPlay: previous requested");
-        return;
-    }
+    dlna_detach_miplay_if_active();
     s_media_generation++;
     s_near_end_count = 0;
     ESP_LOGI(TAG, "Previous");
     s_user_stopped = 0;
     s_accumulated_ms = 0;
-    s_play_start_us = 0;
+    pos_store_i64(&s_play_start_us, 0);
     s_saved_pos_sec = 0;
     free(s_saved_uri); s_saved_uri = NULL;
     if (s_pipe && s_track_uri) {
-        s_grace_until = esp_timer_get_time() + 1000000LL;
+        pos_store_i64(&s_grace_until, esp_timer_get_time() + 1000000LL);
         esp_gmf_pipeline_stop(s_pipe);
         _do_play(s_track_uri, 0);
     } else {
@@ -1920,6 +1967,146 @@ static void audio_player_init(void)
     ESP_LOGI(TAG, "GMF audio pipeline ready (io_http → aud_dec → aud_alc → ch_cvt → bit_cvt → io_codec_dev)");
 }
 
+/* ─────────────────────── MiPlay GMF 管线（音频层统一走 GMF） ───────────────────────
+ * MiPlay 媒体任务只收 RTP/解密 → TS 写 ringbuf；
+ * io_miplay → aud_dec(TS/AAC) → aud_alc → io_codec_dev 负责解码与输出。 */
+static void miplay_pipeline_init(void)
+{
+    if (!s_codec_dev) {
+        s_codec_dev = audio_out_init();
+    }
+    if (!s_pool) {
+        ESP_LOGE(TAG, "[MiPlay] pool not ready");
+        return;
+    }
+
+    /* 1. TS ring buffer：MiPlay 媒体任务 → io_miplay 的数据通道 */
+    s_ts_ringbuf = xRingbufferCreate(32 * 1024, RINGBUF_TYPE_BYTEBUF);
+    if (!s_ts_ringbuf) {
+        ESP_LOGE(TAG, "[MiPlay] TS ring buffer create failed");
+        return;
+    }
+    miplay_set_ts_ringbuf(s_ts_ringbuf);
+
+    /* 2. 注册 io_miplay 到共享 pool */
+    miplay_io_cfg_t miplay_cfg = ESP_GMF_IO_MIPLAY_CFG_DEFAULT();
+    miplay_cfg.dir = ESP_GMF_IO_DIR_READER;
+    esp_gmf_io_handle_t miplay_io = NULL;
+    esp_gmf_err_t ret = esp_gmf_io_miplay_init(&miplay_cfg, &miplay_io);
+    if (ret != ESP_GMF_ERR_OK || !miplay_io) {
+        ESP_LOGE(TAG, "[MiPlay] esp_gmf_io_miplay_init failed: %d", ret);
+        return;
+    }
+    esp_gmf_pool_register_io(s_pool, miplay_io, "io_miplay");
+
+    /* 3. 管线：io_miplay → aud_dec → aud_alc → io_codec_dev */
+    const char *name[] = {"aud_dec", "aud_alc"};
+    ret = esp_gmf_pool_new_pipeline(s_pool,
+        "io_miplay", name, sizeof(name) / sizeof(char *), "io_codec_dev", &s_miplay_pipe);
+    if (ret != ESP_GMF_ERR_OK) {
+        ESP_LOGE(TAG, "[MiPlay] pipeline create failed: %d", ret);
+        return;
+    }
+
+    esp_gmf_io_codec_dev_set_dev(ESP_GMF_PIPELINE_GET_OUT_INSTANCE(s_miplay_pipe), s_codec_dev);
+    /* pool 复制 io 时 ringbuf=NULL，需对管线内副本重新注入 */
+    esp_gmf_io_miplay_set_ringbuf(ESP_GMF_PIPELINE_GET_IN_INSTANCE(s_miplay_pipe), s_ts_ringbuf);
+
+    esp_gmf_pipeline_get_el_by_name(s_miplay_pipe, "aud_alc", &s_miplay_alc_el);
+
+    /* 4. 独立 GMF 任务 */
+    esp_gmf_task_cfg_t task_cfg = DEFAULT_ESP_GMF_TASK_CONFIG();
+    task_cfg.name = "miplay_audio";
+    task_cfg.thread.stack = 24 * 1024;
+    task_cfg.thread.prio = 8;
+    task_cfg.thread.stack_in_ext = true;
+    ret = esp_gmf_task_init(&task_cfg, &s_miplay_task);
+    if (ret != ESP_GMF_ERR_OK) {
+        ESP_LOGE(TAG, "[MiPlay] task init failed: %d", ret);
+        return;
+    }
+    esp_gmf_pipeline_bind_task(s_miplay_pipe, s_miplay_task);
+    esp_gmf_task_set_timeout(s_miplay_task, 20000);
+    esp_gmf_pipeline_set_event(s_miplay_pipe, miplay_pipeline_event_cb, NULL);
+
+    ESP_LOGI(TAG, "MiPlay GMF pipeline ready (io_miplay → aud_dec → aud_alc → io_codec_dev)");
+}
+
+static void miplay_pipeline_start(void)
+{
+    if (!s_miplay_pipe) { ESP_LOGW(TAG, "[MiPlay] pipeline not initialized!"); return; }
+    ESP_LOGW(TAG, "[MiPlay] >>> Starting GMF pipeline <<<");
+    /* 清空 ring buffer 残留 */
+    size_t dummy;
+    void *item;
+    while ((item = xRingbufferReceive(s_ts_ringbuf, &dummy, 0)) != NULL) {
+        vRingbufferReturnItem(s_ts_ringbuf, item);
+    }
+    /* 重连后元素状态残留 STOPPED，必须 reset 回 INITIALIZED 才能 loading_jobs */
+    esp_gmf_pipeline_reset(s_miplay_pipe);
+    esp_gmf_err_t r1 = esp_gmf_pipeline_loading_jobs(s_miplay_pipe);
+    esp_gmf_err_t r2 = esp_gmf_pipeline_run(s_miplay_pipe);
+    ESP_LOGI(TAG, "[MiPlay] jobs=%d run=%d", r1, r2);
+}
+
+static void miplay_pipeline_stop(void)
+{
+    if (!s_miplay_pipe) return;
+    ESP_LOGI(TAG, "[MiPlay] Stopping GMF pipeline");
+    esp_gmf_pipeline_stop(s_miplay_pipe);
+    size_t dummy;
+    void *item;
+    while ((item = xRingbufferReceive(s_ts_ringbuf, &dummy, 0)) != NULL) {
+        vRingbufferReturnItem(s_ts_ringbuf, item);
+    }
+}
+
+static esp_gmf_err_t miplay_pipeline_event_cb(esp_gmf_event_pkt_t *event, void *ctx)
+{
+    (void)ctx;
+    if (!event) return ESP_GMF_ERR_OK;
+
+    if (event->type == ESP_GMF_EVT_TYPE_CHANGE_STATE) {
+        esp_gmf_event_state_t st = (esp_gmf_event_state_t)event->sub;
+        switch (st) {
+            case ESP_GMF_EVENT_STATE_RUNNING:
+                ESP_LOGI(TAG, "[MiPlay] Pipeline running");
+                set_state(PS_PLAYING);
+                if (pos_load_i64(&s_play_start_us) == 0)
+                    pos_store_i64(&s_play_start_us, esp_timer_get_time());
+                break;
+            case ESP_GMF_EVENT_STATE_FINISHED:
+                ESP_LOGI(TAG, "[MiPlay] Pipeline finished");
+                break;
+            case ESP_GMF_EVENT_STATE_STOPPED:
+                ESP_LOGI(TAG, "[MiPlay] Pipeline stopped");
+                if (get_state() == PS_PLAYING) set_state(PS_STOPPED);
+                break;
+            case ESP_GMF_EVENT_STATE_ERROR:
+                ESP_LOGE(TAG, "[MiPlay] Pipeline error");
+                set_state(PS_STOPPED);
+                break;
+            default:
+                break;
+        }
+    } else if (event->type == ESP_GMF_EVT_TYPE_REPORT_INFO
+               && event->sub == ESP_GMF_INFO_SOUND) {
+        if (event->payload && event->payload_size >= sizeof(esp_gmf_info_sound_t)) {
+            esp_gmf_info_sound_t info;
+            memcpy(&info, event->payload, sizeof(info));
+            int rate = info.sample_rates;
+            int bits = info.bits;
+            int ch   = info.channels;
+            if (rate <= 0) rate = 48000;
+            if (bits != 16 && bits != 24 && bits != 32) bits = 16;
+            if (ch <= 0 || ch > 2) ch = 2;
+            ESP_LOGI(TAG, "[MiPlay] Audio info: %d Hz, %d ch, %d bit", rate, ch, bits);
+            audio_out_set_clk(NULL, rate, ch, bits);
+        }
+    }
+    return ESP_GMF_ERR_OK;
+}
+
 /* IO7 歌词切换按键（软件消抖 300ms） */
 static volatile bool s_lyrics_toggle_pending = false;
 static volatile int64_t s_last_lyrics_btn_us = 0;
@@ -1984,9 +2171,10 @@ static void start_dlna(void)
 /* 获取当前播放位置（毫秒） */
 static int get_position_ms(void)
 {
-    if (s_play_start_us > 0) {
+    int64_t start = pos_load_i64(&s_play_start_us);
+    if (start > 0) {
         return s_accumulated_ms +
-               (int)((esp_timer_get_time() - s_play_start_us) / 1000LL);
+               (int)((esp_timer_get_time() - start) / 1000LL);
     }
     return s_accumulated_ms;
 }
@@ -2212,7 +2400,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             ESP_LOGI(TAG, "WiFi restored, resuming playback");
             esp_gmf_pipeline_resume(s_pipe);
             set_state(PS_PLAYING);
-            s_play_start_us = esp_timer_get_time();
+            pos_store_i64(&s_play_start_us, esp_timer_get_time());
         }
     }
 }
@@ -2282,22 +2470,33 @@ static void dlna_on_miplay_connected(bool connected)
     if (s_miplay_media_queue) xQueueReset(s_miplay_media_queue);
     custom_dlna_set_ssdp_suppressed(connected);
     if (connected) {
-        ESP_LOGI(TAG, "=== MiPlay connected → stopping DLNA pipeline ===");
-        /* 停止 DLNA GMF 音频管线（释放 I2S + 内存） */
+        ESP_LOGI(TAG, "=== MiPlay connected → stopping DLNA pipeline, arming MiPlay GMF ===");
+        /* 停 DLNA 管线（两个管线共用 I2S/codec_dev，不能同时输出） */
         if (s_pipe) {
             esp_gmf_pipeline_stop(s_pipe);
             ESP_LOGI(TAG, "DLNA pipeline stopped");
         }
+        /* MiPlay 媒体到达时 media_cb(true) → miplay_pipeline_start()；
+         * 此时管线已就绪，只等 TS 数据流入 ringbuf。 */
         /* 打印内存状态 */
         ESP_LOGI(TAG, "Heap: %lu free, %lu min_free, PSRAM: %lu free",
                  (unsigned long)esp_get_free_heap_size(),
                  (unsigned long)esp_get_minimum_free_heap_size(),
                  (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     } else {
+        /* MiPlay 断开 → 确保其管线停止并排空 ringbuf，恢复 DLNA 可投。
+         * 此前 DLNA 失败常因：MiPlay 断开后残留会话占用 I2S/解码器，
+         * DLNA 的 codec_dev open 抢不到输出。 */
+        ESP_LOGI(TAG, "=== MiPlay disconnected → stopping MiPlay pipeline, resuming DLNA ===");
+        miplay_pipeline_stop();
+        /* 重置 I2S 跟踪，让 DLNA 下次播放强制重配时钟 */
+        s_last_i2s_rate = 0;
+        s_last_i2s_bits = 0;
+        s_last_i2s_ch   = 0;
         lvgl_port_lock();
         lvgl_port_ui_set_speaker_mode(false);
         lvgl_port_unlock();
-        ESP_LOGI(TAG, "=== MiPlay disconnected → DLNA resumed ===");
+        ESP_LOGI(TAG, "=== DLNA ready again ===");
     }
 }
 
@@ -2346,7 +2545,11 @@ void app_main(void)
     /* ── 音频播放 ── */
     audio_player_init();
 
-        
+    /* ── MiPlay GMF 管线（音频层统一走 GMF）── */
+    miplay_pipeline_init();
+    miplay_set_media_start_cb(dlna_on_miplay_media_start);
+    miplay_set_vol_changed_cb(on_miplay_vol_changed);
+
     /* ── DLNA 服务（SSDP + HTTP + SOAP）── */
     start_dlna();
 

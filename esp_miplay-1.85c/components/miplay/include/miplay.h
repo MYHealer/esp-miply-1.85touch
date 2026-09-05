@@ -65,6 +65,27 @@ typedef struct {
 
 typedef void (*miplay_media_cb_t)(const miplay_media_event_t *event);
 void miplay_set_media_cb(miplay_media_cb_t cb);
+
+/**
+ * @brief 注入 GMF TS ring buffer（音频层统一走 GMF 管线）
+ * 媒体任务把解密后的 TS 数据写入该 ringbuf，
+ * 由 main 层 io_miplay → aud_dec → aud_alc → io_codec_dev 管线消费。
+ */
+void miplay_set_ts_ringbuf(void *ringbuf);
+
+/**
+ * @brief 手机端音量变化回调（SetVolume 0x000C 到达时触发）
+ * 统一 GMF 后由 main 层把百分比映射到 MiPlay 管线的 ALC 增益。
+ */
+typedef void (*miplay_vol_changed_cb_t)(uint32_t vol_percent);
+void miplay_set_vol_changed_cb(miplay_vol_changed_cb_t cb);
+
+/**
+ * @brief 媒体流开始/停止回调
+ * media_receive_task 启动时触发 start=true，结束时触发 start=false
+ */
+typedef void (*miplay_media_start_cb_t)(bool start);
+void miplay_set_media_start_cb(miplay_media_start_cb_t cb);
 bool miplay_is_connected(void);
 
 /**

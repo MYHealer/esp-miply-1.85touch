@@ -15,6 +15,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/ringbuf.h"
 #include "esp_log.h"
 #include "esp_attr.h"
 #include "esp_err.h"
@@ -37,10 +38,6 @@
 #include "lwip/netdb.h"
 #include "lwip/sys.h"
 #include <fcntl.h>
-#include "esp_audio_simple_dec.h"
-#include "esp_audio_simple_dec_default.h"
-#include "impl/esp_ts_dec.h"
-#include "board.h"
 #include "miplay.h"
 
 static const char *TAG = "miplay";
@@ -114,11 +111,26 @@ static const char *TAG = "miplay";
 /* ── 连接状态回调（MiPlay 连接时通知 DLNA 暂停）── */
 static miplay_connected_cb_t s_connected_cb = NULL;
 static miplay_media_cb_t s_media_cb = NULL;
+/* ── 手机端音量变化回调（SetVolume → main 层映射到 MiPlay 管线 ALC）── */
+static miplay_vol_changed_cb_t s_vol_changed_cb = NULL;
+/* ── 媒体流开始/停止回调（音频层统一 GMF 后由 main 层启停 MiPlay 管线）── */
+static miplay_media_start_cb_t s_media_start_cb = NULL;
 static volatile bool s_connected = false;
 /* 控制通道与媒体任务并发运行；暂停时媒体任务继续排空网络包，
  * 但丢弃解码结果，避免恢复播放旧的音频缓存。 */
 static volatile bool s_media_paused = false;
 static SemaphoreHandle_t s_send_mux = NULL;
+
+/* ── GMF ring buffer（media_receive_task → io_miplay → aud_dec）──
+ * 音频层统一走 GMF：媒体任务只负责 RTP 收包/解密，TS 数据写入
+ * ringbuf，由 main 层的 MiPlay GMF 管线（io_miplay → aud_dec →
+ * aud_alc → io_codec_dev）解码输出。 */
+static RingbufHandle_t s_ts_ringbuf = NULL;
+
+void miplay_set_ts_ringbuf(RingbufHandle_t rb)
+{
+    s_ts_ringbuf = rb;
+}
 
 /* ── TCP 监听 ── */
 static TaskHandle_t s_tcp_task = NULL;
@@ -1792,17 +1804,9 @@ static void miplay_set_audio_paused(bool paused, const char *reason)
                  paused ? "pause" : "resume",
                  reason ? reason : "control");
     }
-}
-
-static esp_err_t miplay_sync_audio_output_state(bool *output_paused)
-{
-    if (!output_paused) return ESP_ERR_INVALID_ARG;
-
-    bool desired_paused = s_media_paused;
-    if (*output_paused == desired_paused) return ESP_OK;
-
-    *output_paused = desired_paused;
-    return desired_paused ? audio_out_pause() : audio_out_resume();
+    /* 音频层统一走 GMF：暂停/恢复由 main 层通过 MiPlay GMF 管线的
+     * pipeline pause/resume 实现（订阅 s_media_paused 变化），
+     * miplay 组件内不再直接操作 I2S。 */
 }
 
 static void miplay_reset_position_state_hint(void);
@@ -2983,10 +2987,9 @@ static void miplay_rtsp_run(const char *host, int port, int client_sock, uint32_
 
 /* RTSP/media 独立任务统一走 PSRAM 栈，内部 SRAM 留给 Wi-Fi/lwIP/DMA。 */
 #define MEDIA_TASK_PRIORITY 8
-#define MEDIA_PCM_BUF_SIZE (32 * 1024)
+/* 音频层统一走 GMF：媒体任务只收包写 ringbuf，解码交给 main 层管线 */
 #define MEDIA_SOCKET_RCVBUF (32 * 1024)
-#define MEDIA_I2S_WRITE_CHUNK 4096
-#define MEDIA_I2S_WRITE_TIMEOUT_MS 1000
+#define MEDIA_TS_RINGBUF_SEND_TIMEOUT_MS 100
 static BaseType_t miplay_create_task(TaskFunction_t task, const char *name,
                                      uint32_t stack_bytes, void *arg,
                                      UBaseType_t priority, TaskHandle_t *handle,
@@ -3126,51 +3129,22 @@ static void media_receive_task(void *arg)
 
     ESP_LOGI(TAG, "[MEDIA] Task started (sock=%d)", media_sock);
 
-    /* 使用 TS 解码器：内部处理 TS demux + AAC 解码，直接输出 PCM
-     * 与备份版一致，比手动 TS demux 更可靠 */
-    esp_audio_simple_dec_register_default();
-    esp_ts_dec_cfg_t ts_cfg = { .aac_plus_enable = false };
-    esp_audio_simple_dec_cfg_t dec_cfg = {
-        .dec_type = ESP_AUDIO_SIMPLE_DEC_TYPE_TS,
-        .dec_cfg = &ts_cfg,
-        .cfg_size = sizeof(esp_ts_dec_cfg_t),
-        .use_frame_dec = false,
-    };
-    esp_audio_simple_dec_handle_t decoder = NULL;
-    esp_audio_err_t derr = esp_audio_simple_dec_open(&dec_cfg, &decoder);
-    if (derr != ESP_AUDIO_ERR_OK || !decoder) {
-        ESP_LOGE(TAG, "[MEDIA] TS decoder open failed: %d", derr);
-        close(media_sock);
-        miplay_delete_current_task(); return;
-    }
-    ESP_LOGI(TAG, "[MEDIA] TS decoder opened OK");
+    /* 音频层统一走 GMF：本任务只收 RTP → 剥头 → 解密 → TS 写 ringbuf。
+     * TS demux + AAC 解码 + I2S 输出全部由 main 层 MiPlay GMF 管线完成。 */
+    if (s_media_start_cb) s_media_start_cb(true);
 
-    audio_out_init();
-    i2s_chan_handle_t i2s_tx = audio_out_get_tx_handle();
-    if (!i2s_tx) {
-        ESP_LOGE(TAG, "[MEDIA] I2S TX not available");
-        esp_audio_simple_dec_close(decoder);
-        close(media_sock);
-        miplay_delete_current_task(); return;
-    }
-    ESP_LOGI(TAG, "[MEDIA] I2S TX ready, entering read loop");
-
-    /* Match the smooth demo's larger decoder cushion so TCP jitter and AAC
-     * bursty output do not immediately turn into I2S underruns. */
-    size_t pcm_buf_size = MEDIA_PCM_BUF_SIZE;
-    uint8_t *pcm_buf = heap_caps_malloc(pcm_buf_size, MALLOC_CAP_SPIRAM);
     uint8_t *rtp_buf = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
-
-    if (!pcm_buf || !rtp_buf) {
+    if (!rtp_buf) {
         ESP_LOGE(TAG, "[MEDIA] alloc failed");
-        free(pcm_buf); free(rtp_buf);
-        esp_audio_simple_dec_close(decoder);
-        close(media_sock);
+        if (media_sock != rtsp_sock_to_close) close(media_sock);
         miplay_delete_current_task(); return;
     }
+    if (!s_ts_ringbuf) {
+        ESP_LOGE(TAG, "[MEDIA] ts ringbuf not set — GMF pipeline not initialized?");
+    }
 
-    /* 控制线程只更新 s_media_paused；I2S pause/resume 统一在媒体线程串行执行。
-     * 媒体 socket 不能长时间阻塞，否则暂停时 I2S 不能及时清空 DMA 队列。 */
+    /* 控制线程只更新 s_media_paused；媒体线程轮询快照。
+     * 暂停时继续排空 RTP（保持 TCP 窗口流动），只是不写 ringbuf。 */
     int media_rcvbuf = MEDIA_SOCKET_RCVBUF;
     if (setsockopt(media_sock, SOL_SOCKET, SO_RCVBUF,
                    &media_rcvbuf, sizeof(media_rcvbuf)) < 0) {
@@ -3179,33 +3153,17 @@ static void media_receive_task(void *arg)
     struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 };
     setsockopt(media_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    uint32_t pkt_count = 0, rtp_total = 0, pcm_total = 0, pcm_dropped = 0;
-    bool i2s_configured = false;
+    uint32_t pkt_count = 0, rtp_total = 0, ts_total = 0, ts_dropped = 0;
     bool playing_reported = false;
-    bool media_info_query_sent = false;
-    bool output_paused = !s_media_paused;
-    esp_err_t output_ret = miplay_sync_audio_output_state(&output_paused);
-    if (output_ret != ESP_OK) {
-        ESP_LOGW(TAG, "[MEDIA] initial audio output state failed: %s",
-                 esp_err_to_name(output_ret));
-    }
+    bool was_paused_snapshot = false;
 
     while (s_running && s_media_generation == generation) {
-        /* 控制线程只更新状态；这里同步本地快照，覆盖无包时的状态变化。 */
-        output_ret = miplay_sync_audio_output_state(&output_paused);
-        if (output_ret != ESP_OK) {
-            ESP_LOGW(TAG, "[MEDIA] sync audio output state failed: %s",
-                     esp_err_to_name(output_ret));
-        }
+        /* 控制线程只更新 s_media_paused；这里同步本地快照。 */
+        was_paused_snapshot = s_media_paused;
         /* ── 读取4字节 interleaved RTP 帧头：$ + channel + len(u16 BE) ── */
         uint8_t hdr[4];
         int got = 0;
         while (got < 4 && s_running && s_media_generation == generation) {
-            output_ret = miplay_sync_audio_output_state(&output_paused);
-            if (output_ret != ESP_OK) {
-                ESP_LOGW(TAG, "[MEDIA] sync audio output state failed: %s",
-                         esp_err_to_name(output_ret));
-            }
             int n = recv(media_sock, hdr + got, 4 - got, 0);
             if (n <= 0) {
                 if (!s_running) break;
@@ -3281,166 +3239,58 @@ static void media_receive_task(void *arg)
             decrypt_ts_media(ts_data, ts_len, stream_key);
         }
 
-        /* 暂停期间继续解码但丢弃 PCM，保持 TS/AAC 解码器的连续性；同时
-         * 排空 RTP，避免手机端 TCP 窗口被填满，恢复后不会播放旧缓存。 */
-        /* ── 直接送 TS 解码器（内部处理 TS demux + AAC decode → PCM）── */
-        esp_audio_simple_dec_raw_t raw = { .buffer = ts_data, .len = ts_len, .eos = false };
-        while (raw.len > 0 && s_running && s_media_generation == generation) {
-            esp_audio_simple_dec_out_t out = {
-                .buffer = pcm_buf, .len = pcm_buf_size, .decoded_size = 0
-            };
-            derr = esp_audio_simple_dec_process(decoder, &raw, &out);
-            if (derr == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
-                if (out.needed_size <= pcm_buf_size || out.needed_size > 64 * 1024) {
-                    ESP_LOGE(TAG, "[MEDIA] invalid decoder buffer request: %u",
-                             (unsigned)out.needed_size);
-                    goto m_cleanup;
+        /* ── TS 数据写入 GMF ringbuf（解码在 main 层 MiPlay 管线完成）──
+         * 暂停期间继续排空 RTP 但不写 ringbuf，保持 TCP 窗口流动，
+         * 恢复后不会播放旧缓存。ringbuf 满时丢弃（网络快于解码）。 */
+        if (ts_len > 0) {
+            if (!was_paused_snapshot && s_ts_ringbuf) {
+                if (xRingbufferSend(s_ts_ringbuf, ts_data, ts_len,
+                                    pdMS_TO_TICKS(100)) == pdTRUE) {
+                    ts_total += ts_len;
+                } else {
+                    ts_dropped += ts_len;
                 }
-                uint8_t *bigger = realloc(pcm_buf, out.needed_size);
-                if (!bigger) goto m_cleanup;
-                pcm_buf = bigger;
-                pcm_buf_size = out.needed_size;
-                continue;
             }
-            if (derr != ESP_AUDIO_ERR_OK) break;
-            if (raw.consumed > raw.len || out.decoded_size > pcm_buf_size) {
-                ESP_LOGE(TAG, "[MEDIA] decoder returned invalid sizes: consumed=%u/%u decoded=%u/%u",
-                         (unsigned)raw.consumed, (unsigned)raw.len,
-                         (unsigned)out.decoded_size, (unsigned)pcm_buf_size);
-                goto m_cleanup;
-            }
-            raw.buffer += raw.consumed;
-            raw.len -= raw.consumed;
-
-            if (out.decoded_size > 0) {
-                output_ret = miplay_sync_audio_output_state(&output_paused);
-                if (output_ret != ESP_OK) {
-                    ESP_LOGW(TAG, "[MEDIA] pcm audio output state failed: %s",
-                             esp_err_to_name(output_ret));
-                    pcm_dropped += (uint32_t)out.decoded_size;
-                    continue;
-                }
-                if (!media_info_query_sent) {
-                    /* Do not query GetMediaInfo from the receiver. HyperOS may
-                     * treat that as adopting the receiver snapshot and clear
-                     * the phone cover. SetMediaInfo is the metadata source. */
-                    media_info_query_sent = true;
-                }
-                if (!output_paused && !i2s_configured) {
-                    esp_audio_simple_dec_info_t info;
-                    if (esp_audio_simple_dec_get_info(decoder, &info) == ESP_AUDIO_ERR_OK) {
-                        ESP_LOGI(TAG, "[MEDIA] Audio: %luHz %dbit %dch",
-                                 (unsigned long)info.sample_rate,
-                                 info.bits_per_sample, info.channel);
-                        audio_out_set_clk(NULL, info.sample_rate,
-                                          info.channel, info.bits_per_sample);
-                        i2s_configured = true;
-                        /* Reconfiguration may close/open the codec while the
-                         * stream is active. Force the requested state again
-                         * before the first write so pause->resume races do
-                         * not turn into a fatal I2S INVALID_STATE. */
-                        output_paused = !s_media_paused;
-                        output_ret = miplay_sync_audio_output_state(&output_paused);
-                        if (output_ret != ESP_OK) {
-                            ESP_LOGW(TAG, "[MEDIA] post-config audio output state failed: %s",
-                                     esp_err_to_name(output_ret));
-                            pcm_dropped += (uint32_t)out.decoded_size;
-                            continue;
-                        }
-                    }
-                }
-                if (!output_paused && !playing_reported) {
-                    miplay_emit_state_event(2, MIPLAY_PLAYER_STATE_PLAYING);
-                    playing_reported = true;
-                    ESP_LOGI(TAG, "[MEDIA] first PCM -> player state PLAYING");
-                }
-                /* 应用 MiPlay 音量增益 */
-                uint32_t vol = s_volume_percent;
-                if (vol < 100) {
-                    int16_t *samples = (int16_t *)pcm_buf;
-                    size_t nsamples = out.decoded_size / 2;
-                    for (size_t i = 0; i < nsamples; i++) {
-                        samples[i] = (int16_t)((int32_t)samples[i] * (int32_t)vol / 100);
-                    }
-                }
-                /* Stability first: write short chunks, but allow I2S to block.
-                 * The previous timeout=0 path dropped PCM whenever the short
-                 * DMA queue was full, which made MiPlay sound choppy. */
-                if (!output_paused && s_media_generation == generation) {
-                    size_t pcm_offset = 0;
-                    bool recovered_write_state = false;
-                    while (pcm_offset < out.decoded_size && s_running &&
-                           s_media_generation == generation && !s_media_paused) {
-                        size_t write_size = out.decoded_size - pcm_offset;
-                        if (write_size > MEDIA_I2S_WRITE_CHUNK) write_size = MEDIA_I2S_WRITE_CHUNK;
-                        size_t bytes_written = 0;
-                        esp_err_t write_ret = audio_out_write(pcm_buf + pcm_offset,
-                                                              write_size, &bytes_written,
-                                                              MEDIA_I2S_WRITE_TIMEOUT_MS);
-                        if (write_ret == ESP_ERR_INVALID_STATE && s_media_paused) {
-                            pcm_dropped += (uint32_t)(out.decoded_size - pcm_offset);
-                            break;
-                        }
-                        if (write_ret == ESP_ERR_INVALID_STATE && !recovered_write_state) {
-                            recovered_write_state = true;
-                            ESP_LOGW(TAG, "[MEDIA] I2S state drifted; resuming output once");
-                            (void)audio_out_pause();
-                            output_ret = audio_out_resume();
-                            output_paused = output_ret != ESP_OK;
-                            if (output_ret == ESP_OK) continue;
-                        }
-                        if (write_ret != ESP_OK) {
-                            ESP_LOGW(TAG, "[MEDIA] I2S write failed: %s",
-                                     esp_err_to_name(write_ret));
-                            goto m_cleanup;
-                        }
-                        if (bytes_written == 0) {
-                            ESP_LOGW(TAG, "[MEDIA] I2S write stalled");
-                            goto m_cleanup;
-                        }
-                        pcm_offset += bytes_written;
-                        pcm_total += bytes_written;
-                    }
-                    if (s_media_paused && pcm_offset < out.decoded_size)
-                        pcm_dropped += (uint32_t)(out.decoded_size - pcm_offset);
-                }
+            if (!playing_reported && !was_paused_snapshot) {
+                miplay_emit_state_event(2, MIPLAY_PLAYER_STATE_PLAYING);
+                playing_reported = true;
+                ESP_LOGI(TAG, "[MEDIA] first TS pkt -> player state PLAYING");
             }
         }
 
         if (pkt_count % 100 == 1) {
-            ESP_LOGI(TAG, "[MEDIA] pkts=%lu rtp=%luKB pcm=%luKB drop=%luKB",
+            ESP_LOGI(TAG, "[MEDIA] pkts=%lu rtp=%luKB ts=%luKB drop=%luKB paused=%d",
                      (unsigned long)pkt_count, (unsigned long)(rtp_total / 1024),
-                     (unsigned long)(pcm_total / 1024),
-                     (unsigned long)(pcm_dropped / 1024));
+                     (unsigned long)(ts_total / 1024),
+                     (unsigned long)(ts_dropped / 1024),
+                     (int)was_paused_snapshot);
         }
     }
     if (s_media_generation != generation)
         ESP_LOGI(TAG, "[MEDIA] Replaced by newer session (gen %lu -> %lu)",
                  (unsigned long)generation, (unsigned long)s_media_generation);
 m_cleanup:
+    /* generation 不匹配 = 旧 session 被新 session 替代，不应停新管线 */
     if (s_media_generation == generation) {
-        esp_err_t stop_ret = audio_out_pause();
-        if (stop_ret != ESP_OK) {
-            ESP_LOGW(TAG, "[MEDIA] cleanup audio output pause failed: %s",
-                     esp_err_to_name(stop_ret));
-        }
+        if (s_media_start_cb) s_media_start_cb(false);
         miplay_mark_media_session_closed(client_sock, generation, "media task ended");
+    } else {
+        ESP_LOGI(TAG, "[MEDIA] Stale session cleanup, skip stop callback");
     }
     if (playing_reported && s_media_generation == generation) {
         miplay_emit_state_event(0, MIPLAY_PLAYER_STATE_STOPPED);
         ESP_LOGI(TAG, "[MEDIA] stream ended -> player state STOPPED");
     }
-    free(rtp_buf); free(pcm_buf);
-    esp_audio_simple_dec_close(decoder);
+    free(rtp_buf);
     close(media_sock);
     /* RTSP socket 在媒体结束后关闭（之前不关是为了保持会话活跃） */
     if (rtsp_sock_to_close >= 0) close(rtsp_sock_to_close);
     if (s_image_sock >= 0) { close(s_image_sock); s_image_sock = -1; }
     s_image_port = s_multi_port = 0;
-    ESP_LOGI(TAG, "[MEDIA] Task ended, %lu pkts, %luKB rtp, %luKB pcm, %luKB dropped",
+    ESP_LOGI(TAG, "[MEDIA] Task ended, %lu pkts, %luKB rtp, %luKB ts, %luKB dropped",
              (unsigned long)pkt_count, (unsigned long)(rtp_total / 1024),
-             (unsigned long)(pcm_total / 1024),
-             (unsigned long)(pcm_dropped / 1024));
+             (unsigned long)(ts_total / 1024),
+             (unsigned long)(ts_dropped / 1024));
     miplay_delete_current_task();
 }
 
@@ -4667,6 +4517,7 @@ static void handle_client(miplay_session_t *session)
                             s_volume_percent = vol;
                             miplay_save_volume(vol);
                             ESP_LOGI(TAG, "Volume set to %u%% (saved)", (unsigned)vol);
+                            if (s_vol_changed_cb) s_vol_changed_cb(vol);
                         }
                     }
                     uint8_t ack[5] = {0};
@@ -5264,6 +5115,16 @@ void miplay_set_connected_cb(miplay_connected_cb_t cb)
 void miplay_set_media_cb(miplay_media_cb_t cb)
 {
     s_media_cb = cb;
+}
+
+void miplay_set_media_start_cb(miplay_media_start_cb_t cb)
+{
+    s_media_start_cb = cb;
+}
+
+void miplay_set_vol_changed_cb(miplay_vol_changed_cb_t cb)
+{
+    s_vol_changed_cb = cb;
 }
 
 bool miplay_is_connected(void)
