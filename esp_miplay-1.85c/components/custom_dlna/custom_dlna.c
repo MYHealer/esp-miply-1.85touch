@@ -314,7 +314,7 @@ static void send_position_info(httpd_req_t *req)
     int meta_len = strlen(meta);
 
     int resp_sz = 1024 + strlen(uri) + meta_len + strlen(rel) + strlen(dur_str);
-    char *resp = malloc(resp_sz);
+    char *resp = heap_caps_malloc(resp_sz, MALLOC_CAP_SPIRAM);
     if (!resp) { httpd_resp_send_500(req); return; }
     snprintf(resp, resp_sz,
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
@@ -369,7 +369,7 @@ static void send_media_info(httpd_req_t *req)
     fmt_time(dur, dur_str, sizeof(dur_str));
 
     int resp_sz = 1024 + strlen(uri) + strlen(meta) + strlen(dur_str);
-    char *resp = malloc(resp_sz);
+    char *resp = heap_caps_malloc(resp_sz, MALLOC_CAP_SPIRAM);
     if (!resp) { httpd_resp_send_500(req); return; }
     snprintf(resp, resp_sz,
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
@@ -438,7 +438,7 @@ static void gena_notify(const char *xml_body, const char *service_type)
         snprintf(seq_str, sizeof(seq_str), "%d", s_subs[i].seq++);
         size_t body_len = strlen(xml_body);
         size_t req_cap = body_len + 1024;
-        char *req = malloc(req_cap);
+        char *req = heap_caps_malloc(req_cap, MALLOC_CAP_SPIRAM);
         if (!req) {
             ESP_LOGW(TAG, "GENA notify alloc %u failed", (unsigned)req_cap);
             close(sock);
@@ -547,7 +547,7 @@ void custom_dlna_notify_transport_state(void)
     /* 动态分配：metadata 可能很大 */
     int meta_len = strlen(meta);
     int buf_size = 2048 + meta_len * 4;  /* XML entity encoding expands ~4x */
-    char *buf = malloc(buf_size);
+    char *buf = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
     if (!buf) { ESP_LOGW(TAG, "OOM for AVT notify"); return; }
 
     /* QQ 音乐需要扩展 LastChange 字段（TransportStatus=OK 等），
@@ -637,7 +637,7 @@ void custom_dlna_notify_rcs(void)
     int vol = s_cfg->get_volume ? s_cfg->get_volume() : s_volume_cache;
     int mute = s_cfg->get_mute ? s_cfg->get_mute() : s_mute_cache;
     notify_msg_t msg;
-    msg.data = malloc(1024);
+    msg.data = heap_caps_malloc(1024, MALLOC_CAP_SPIRAM);
     if (!msg.data) { ESP_LOGW(TAG, "OOM for RCS notify"); return; }
     snprintf(msg.data, 1024,
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
@@ -703,7 +703,7 @@ static void handle_avt_control(httpd_req_t *req)
         httpd_resp_send_500(req);
         return;
     }
-    char *body = malloc(req->content_len + 1);
+    char *body = heap_caps_malloc(req->content_len + 1, MALLOC_CAP_SPIRAM);
     if (!body) { httpd_resp_send_500(req); return; }
     int body_len = 0;
     while (body_len < req->content_len) {
@@ -1136,7 +1136,7 @@ static esp_err_t event_handler(httpd_req_t *req)
     if (req->content_len > 0) {
         size_t rl = req->content_len;
         if (rl > 4096) rl = 4096;
-        char *buf = malloc(rl + 1);
+        char *buf = heap_caps_malloc(rl + 1, MALLOC_CAP_SPIRAM);
         if (buf) {
             int total = 0;
             while (total < (int)rl) {
@@ -1304,7 +1304,7 @@ static void ssdp_task(void *arg)
 
     ESP_LOGI(TAG, "SSDP listening on port %d", SSDP_PORT);
 
-    char *buf = malloc(2048);
+    char *buf = heap_caps_malloc(2048, MALLOC_CAP_SPIRAM);
     if (!buf) { close(sock); custom_dlna_delete_current_task(); return; }
 
     while (1) {

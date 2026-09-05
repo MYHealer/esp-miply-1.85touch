@@ -56,6 +56,15 @@
 
 static const char *TAG = "DLNA_APP";
 
+/* PSRAM strdup：URI/元数据字符串统一放 PSRAM，节省内部 SRAM */
+static char *strdup_psram(const char *s) {
+    if (!s) return NULL;
+    size_t len = strlen(s) + 1;
+    char *p = heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+    if (p) memcpy(p, s, len);
+    return p;
+}
+
 #define DLNA_DEVICE_UUID "8db0797a-f01a-4949-8f59-51188b18180b"
 
 /* ─────────────────────── 播放状态机 ─────────────────────── */
@@ -832,7 +841,7 @@ static void cb_set_uri(const char *uri)
     /* 新 URI 不管是否同一首，进度都归零（新歌从头播，同首歌重播也从0开始） */
     s_saved_pos_sec = 0;
     free(s_track_uri);
-    s_track_uri = uri ? strdup(uri) : NULL;
+    s_track_uri = uri ? strdup_psram(uri) : NULL;
     /* 新 URI → 重置时长缓存 + 歌词 */
     s_dur_cache_sec = 0;
     s_cur_title[0] = '\0';
@@ -934,7 +943,7 @@ static void _do_play(const char *uri, int seek_sec)
         pos_store_i64(&s_grace_until, esp_timer_get_time() + 8000000LL);
         s_user_stopped = 0;
         free(s_playing_uri);
-        s_playing_uri = strdup(uri);
+        s_playing_uri = strdup_psram(uri);
         if (seek_sec > 0) {
             vTaskDelay(pdMS_TO_TICKS(300));
             /* GMF seek 按字节偏移，粗略估算（128kbps MP3 ≈ 16000 B/s） */
@@ -1025,7 +1034,12 @@ static void cb_play(void)
 
 static void cb_pause(void)
 {
-    dlna_detach_miplay_if_active();
+    /* MiPlay 模式：转发 pause 给手机，不脱离 MiPlay */
+    if (s_miplay_connected) {
+        ESP_LOGI(TAG, "[MiPlay] -> pause");
+        miplay_send_receiver_control("pause", 0);
+        return;
+    }
     play_state_t cur = get_state();
     ESP_LOGI(TAG, "Pause (state=%d)", cur);
     if (s_pipe && cur == PS_PLAYING) {
@@ -1036,7 +1050,7 @@ static void cb_pause(void)
         }
         s_saved_pos_sec = s_accumulated_ms / 1000;
         free(s_saved_uri);
-        s_saved_uri = s_track_uri ? strdup(s_track_uri) : NULL;
+        s_saved_uri = s_track_uri ? strdup_psram(s_track_uri) : NULL;
         esp_gmf_err_t err = esp_gmf_pipeline_pause(s_pipe);
         set_state(PS_PAUSED);
         s_user_stopped = 1;
@@ -1047,6 +1061,14 @@ static void cb_pause(void)
 /* ── 播放/暂停切换 ── */
 static void cb_play_toggle(void)
 {
+    /* MiPlay 模式：转发 play/pause 给手机 */
+    if (s_miplay_connected) {
+        play_state_t cur = get_state();
+        const char *action = (cur == PS_PLAYING) ? "pause" : "play";
+        ESP_LOGI(TAG, "[MiPlay] -> %s", action);
+        miplay_send_receiver_control(action, 0);
+        return;
+    }
     play_state_t cur = get_state();
     if (cur == PS_PLAYING) {
         cb_pause();
@@ -1078,7 +1100,7 @@ static void cb_stop(void)
     }
     s_saved_pos_sec = s_accumulated_ms / 1000;
     free(s_saved_uri);
-    s_saved_uri = s_track_uri ? strdup(s_track_uri) : NULL;
+    s_saved_uri = s_track_uri ? strdup_psram(s_track_uri) : NULL;
     s_user_stopped = 1;
     /* 宽限期：抑制 pipeline_stop 触发的中间 STOPPED 事件
      * 网易云流程: Stop → SetAVTransportURI → Play，可能间隔很短 */
@@ -1181,7 +1203,12 @@ static bool is_video_uri(const char *uri)
 
 /* Next — 严格对齐 miair-next next_track() 流程 */
 static void cb_next(void) {
-    dlna_detach_miplay_if_active();
+    /* MiPlay 模式：转发 next 给手机，不脱离 MiPlay */
+    if (s_miplay_connected) {
+        ESP_LOGI(TAG, "[MiPlay] -> key-next");
+        miplay_send_receiver_control("next", 0);
+        return;
+    }
     ESP_LOGI(TAG, "Next (next_uri=%s) state=%d", s_next_uri ? s_next_uri : "(null)", (int)get_state());
     s_user_stopped = 0;
     s_accumulated_ms = 0;
@@ -1239,9 +1266,14 @@ static void cb_next(void) {
                 ESP_LOGI(TAG, "TRANSITIONING: got next URI after %dms", waited);
                 break;
             }
-            /* 检测是否有新媒体介入（generation 变了） */
+            /* 检测是否有新媒体介入（generation 变了 = SetAVTransportURI 已触发播放） */
             if (gen != s_media_generation) {
-                ESP_LOGI(TAG, "TRANSITIONING: generation changed, abort");
+                ESP_LOGI(TAG, "TRANSITIONING: generation changed (media intervened), abort");
+                return;
+            }
+            /* 检测播放是否已被 SetAVTransportURI → cb_play 启动 */
+            if (get_state() == PS_PLAYING) {
+                ESP_LOGI(TAG, "TRANSITIONING: already playing (SetAVTransportURI), abort");
                 return;
             }
         }
@@ -1258,6 +1290,9 @@ static void cb_next(void) {
             }
             custom_dlna_update_uri(s_track_uri, next_meta);
             free(next_meta);
+        } else if (gen != s_media_generation || get_state() == PS_PLAYING) {
+            /* 超时期间有新媒体介入，不要覆盖播放状态 */
+            ESP_LOGI(TAG, "TRANSITIONING: media intervened during wait, skip stop");
         } else {
             /* 超时无下一曲 → 模拟自然播完 */
             if (s_dur_cache_sec > 0) {
@@ -1272,7 +1307,12 @@ static void cb_next(void) {
     custom_dlna_notify_transport_state_async();
 }
 static void cb_previous(void) {
-    dlna_detach_miplay_if_active();
+    /* MiPlay 模式：转发 prev 给手机，不脱离 MiPlay */
+    if (s_miplay_connected) {
+        ESP_LOGI(TAG, "[MiPlay] -> key-prev");
+        miplay_send_receiver_control("prev", 0);
+        return;
+    }
     s_media_generation++;
     s_near_end_count = 0;
     ESP_LOGI(TAG, "Previous");
@@ -1296,9 +1336,9 @@ static void cb_set_next_uri(const char *uri, const char *metadata)
 {
     ESP_LOGI(TAG, "SetNextURI: %s", uri ? uri : "(null)");
     free(s_next_uri);
-    s_next_uri = uri ? strdup(uri) : NULL;
+    s_next_uri = uri ? strdup_psram(uri) : NULL;
     free(s_next_metadata);
-    s_next_metadata = metadata ? strdup(metadata) : NULL;
+    s_next_metadata = metadata ? strdup_psram(metadata) : NULL;
 }
 
 static void fetch_album_art_async(const char *url);
@@ -1881,7 +1921,7 @@ static void album_art_task(void *arg)
 static void fetch_album_art_async(const char *url)
 {
     if (!url || !s_album_art_queue) return;
-    char *url_copy = strdup(url);
+    char *url_copy = strdup_psram(url);
     if (!url_copy) return;
     s_album_art_gen++;  /* 递增代次，worker 检测到 gen 变化会放弃旧请求 */
     ESP_LOGI(TAG, "Cover queued: len=%u %.160s (gen=%d)",

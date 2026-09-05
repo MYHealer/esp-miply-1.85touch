@@ -224,7 +224,7 @@ static void miplay_nvs_save_task(void *arg)
 
 static void miplay_save_volume(uint32_t vol)
 {
-    nvs_vol_arg_t *a = malloc(sizeof(nvs_vol_arg_t));
+    nvs_vol_arg_t *a = heap_caps_malloc(sizeof(nvs_vol_arg_t), MALLOC_CAP_SPIRAM);
     if (!a) return;
     a->vol = vol;
     /* 内部 SRAM 栈（不指定 WithCaps），2KB 足够 NVS 写 */
@@ -943,7 +943,7 @@ static void miplay_lan_task(void *arg)
         if (!found) continue;
 
         /* 组装应答：覆盖 TX ID（堆分配避免栈溢出） */
-        uint8_t *reply = malloc(s_lan_response_len);
+        uint8_t *reply = heap_caps_malloc(s_lan_response_len, MALLOC_CAP_SPIRAM);
         if (!reply) continue;
         memcpy(reply, s_lan_response, s_lan_response_len);
         reply[0] = rx_buf[0];
@@ -1108,7 +1108,7 @@ static int safety_encrypt(const uint8_t *plaintext, size_t pt_len,
     size_t padded_len = pt_len + pad_len;
     if (SAFETY_DATA_HDR_LEN + padded_len > out_max) return 0;
 
-    uint8_t *padded = calloc(1, padded_len);
+    uint8_t *padded = heap_caps_calloc(1, padded_len, MALLOC_CAP_SPIRAM);
     if (!padded) return 0;
     if (pt_len > 0) memcpy(padded, plaintext, pt_len);
     /* 剩余已为零 */
@@ -1181,7 +1181,7 @@ static int safety_decrypt(const uint8_t *data, size_t data_len,
         ESP_LOGI(TAG, "SD ct_len=%d pad=%d pt_len=%d", (int)ct_len, pad_len, (int)pt_len);
     }
 
-    uint8_t *decrypted = malloc(ct_len);
+    uint8_t *decrypted = heap_caps_malloc(ct_len, MALLOC_CAP_SPIRAM);
     if (!decrypted) return -1;
     if (!aes_cbc_decrypt(key, iv, data + SAFETY_DATA_HDR_LEN, decrypted, ct_len)) {
         ESP_LOGW(TAG, "safety_decrypt: aes_cbc_decrypt failed");
@@ -1339,7 +1339,7 @@ static int send_plain_envelope(int sock, uint16_t cmd16, uint16_t seq,
                                const uint8_t *payload, uint32_t payload_len)
 {
     if (payload_len > 2048) return -1;
-    uint8_t *envelope = malloc(1 + 3 + 4 + 1 + payload_len);
+    uint8_t *envelope = heap_caps_malloc(1 + 3 + 4 + 1 + payload_len, MALLOC_CAP_SPIRAM);
     if (!envelope) return -1;
     int elen = safety_envelope_encode(true, SAFETY_VALUE_TYPE,
                                       payload, payload_len,
@@ -2567,7 +2567,7 @@ static int build_device_info_payload(uint8_t *out, size_t out_max)
     int num_fields = sizeof(fields) / sizeof(fields[0]);
 
     size_t body_cap = 512;
-    uint8_t *body = malloc(body_cap);
+    uint8_t *body = heap_caps_malloc(body_cap, MALLOC_CAP_SPIRAM);
     if (!body) return -1;
     int body_off = 0;
     for (int i = 0; i < num_fields; i++) {
@@ -2734,7 +2734,7 @@ static int rtsp_read_msg(int sock, char *headers, size_t hdr_max,
                           char *body, size_t body_max, int *body_len)
 {
     if (!s_rtsp_buf) {
-        s_rtsp_buf = malloc(RTSP_BUF_SIZE);
+        s_rtsp_buf = heap_caps_malloc(RTSP_BUF_SIZE, MALLOC_CAP_SPIRAM);
         if (!s_rtsp_buf) return -1;
         s_rtsp_buf_used = 0;
     }
@@ -3350,8 +3350,8 @@ static void miplay_rtsp_run(const char *host, int port, int client_sock, uint32_
     rtsp_host_local[sizeof(rtsp_host_local) - 1] = 0;
     rtsp_port_local = port;
 
-    headers = malloc(RTSP_BUF_SIZE);
-    body = malloc(RTSP_BUF_SIZE);
+    headers = heap_caps_malloc(RTSP_BUF_SIZE, MALLOC_CAP_SPIRAM);
+    body = heap_caps_malloc(RTSP_BUF_SIZE, MALLOC_CAP_SPIRAM);
     if (!headers || !body) {
         free(headers); free(body);
         close(rtsp_sock); rtsp_sock = -1;
@@ -4379,7 +4379,7 @@ static void handle_client(miplay_session_t *session)
                 /* ── 设备信息请求 (0x001E) ── */
                 if (cmd == CMD_GET_DEVICE_INFO) {
                     ESP_LOGI(TAG, "GetDeviceInfo received");
-                    uint8_t *devinfo = malloc(1024);
+                    uint8_t *devinfo = heap_caps_malloc(1024, MALLOC_CAP_SPIRAM);
                     if (devinfo) {
                         int di_len = build_device_info_payload(devinfo, 1024);
                         if (di_len > 0) {
