@@ -70,6 +70,7 @@ LV_IMG_DECLARE(ui_img_xiyi1_png);
 LV_IMG_DECLARE(ui_img_jiaopian_png);
 LV_IMG_DECLARE(ui_img_citou_png);
 LV_FONT_DECLARE(lv_font_simsun_16_cjk);
+LV_FONT_DECLARE(lv_font_simsun_16_supplement);
 
 /* Brookesia assets used by the copied system UI. */
 LV_FONT_DECLARE(esp_brookesia_font_maison_neue_book_12);
@@ -1465,6 +1466,10 @@ void lvgl_port_ui_create(void)
 
     s_wlan_ssid_font = esp_brookesia_font_maison_neue_book_22;
     s_wlan_ssid_font.fallback = &lv_font_simsun_16_cjk;
+
+    /* CJK 字体 fallback 链：CJK → 补丁字体(拉丁扩展/韩文Jamo/注音等) */
+    lv_font_t *cjk = (lv_font_t *)&lv_font_simsun_16_cjk;
+    cjk->fallback = &lv_font_simsun_16_supplement;
 
     /* 关闭屏幕滚动条 */
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
