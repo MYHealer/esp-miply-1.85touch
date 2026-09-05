@@ -274,7 +274,8 @@ typedef struct {
     TaskHandle_t task;
 } miplay_session_t;
 
-static miplay_session_t s_sessions[MIPLAY_MAX_CONTROL_SESSIONS];
+/* 控制会话槽：只在任务上下文持 s_session_mux 访问（无 ISR/DMA 路径），可安全放 PSRAM */
+static EXT_RAM_BSS_ATTR miplay_session_t s_sessions[MIPLAY_MAX_CONTROL_SESSIONS];
 static SemaphoreHandle_t s_session_mux = NULL;
 static uint32_t s_session_count = 0;
 static void miplay_delete_current_task(void);
