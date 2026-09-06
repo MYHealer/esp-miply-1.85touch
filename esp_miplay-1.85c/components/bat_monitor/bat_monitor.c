@@ -24,6 +24,8 @@ static const char *TAG = "BAT_MON";
 #define BAT_VOLT_MID        3.85f
 #define BAT_VOLT_MAX        4.20f   /* 100% */
 #define BAT_VOLT_CHARGING   4.15f   /* 高于此值视为充电中 */
+/* 充电时端电压被内阻抬高，映射阈值需整体上移，否则电量虚高 */
+#define BAT_CHARGE_VOLT_SHIFT 0.15f
 
 static adc_oneshot_unit_handle_t s_adc_handle = NULL;
 static adc_cali_handle_t         s_cali_handle = NULL;
@@ -127,20 +129,34 @@ float bat_monitor_get_volts(void)
     return ((float)mv / 1000.0f) * BAT_DIVIDER_RATIO / BAT_MEASURE_OFFSET;
 }
 
+/* 电压 → 电量百分比
+ *
+ * 关键点：充电时端电压 = 开路电压 + 电流×内阻，恒流阶段被抬高约 0.1~0.2V。
+ * 如果充电时也套用放电曲线，同一 SOC 会算出偏高的百分比——这就是
+ * "一插上充电就从 75% 跳到 100%" 的原因。
+ * 因此充电态与放电态使用两套阈值（充电曲线整体上移 CHARGE_VOLT_SHIFT）。
+ */
 int bat_monitor_get_percent(void)
 {
     float volts = bat_monitor_get_volts();
     if (volts <= 0.0f) return 0;
-    if (volts <= BAT_VOLT_MIN) return 0;
-    if (volts >= BAT_VOLT_MAX) return 100;
 
-    /* 分段线性：低段斜率小（3.3~3.6 掉得快），中段陡，高段缓 */
-    if (volts < BAT_VOLT_LOW) {
-        return (int)((volts - BAT_VOLT_MIN) / (BAT_VOLT_LOW - BAT_VOLT_MIN) * 20.0f);
-    } else if (volts < BAT_VOLT_MID) {
-        return 20 + (int)((volts - BAT_VOLT_LOW) / (BAT_VOLT_MID - BAT_VOLT_LOW) * 40.0f);
+    const float shift = bat_monitor_is_charging() ? BAT_CHARGE_VOLT_SHIFT : 0.0f;
+    const float v_min = BAT_VOLT_MIN + shift;
+    const float v_low = BAT_VOLT_LOW + shift;
+    const float v_mid = BAT_VOLT_MID + shift;
+    const float v_max = BAT_VOLT_MAX + shift;
+
+    if (volts <= v_min) return 0;
+    if (volts >= v_max) return 100;
+
+    /* 分段线性：低段掉得快，中段陡，高段缓 */
+    if (volts < v_low) {
+        return (int)((volts - v_min) / (v_low - v_min) * 20.0f);
+    } else if (volts < v_mid) {
+        return 20 + (int)((volts - v_low) / (v_mid - v_low) * 40.0f);
     } else {
-        return 60 + (int)((volts - BAT_VOLT_MID) / (BAT_VOLT_MAX - BAT_VOLT_MID) * 40.0f);
+        return 60 + (int)((volts - v_mid) / (v_max - v_mid) * 40.0f);
     }
 }
 

@@ -1228,8 +1228,19 @@ static void _update_system_status(void)
     static bool s_bat_charging_cached = false;
     static uint8_t s_bat_tick = 0;
     if (s_bat_tick == 0) {
-        s_bat_pct_cached = bat_monitor_get_percent();
+        int raw_pct = bat_monitor_get_percent();
         s_bat_charging_cached = bat_monitor_is_charging();
+
+        /* 变化率限速：真实电池不可能在 10s 内跳几十个百分点。
+         * 插拔充电器时端电压会阶跃，直接采信会导致百分比瞬跳，
+         * 这里限制单次更新幅度，让显示平滑爬升/下降。 */
+        if (s_bat_pct_cached == 0) {
+            s_bat_pct_cached = raw_pct;              /* 首帧直接采信 */
+        } else if (raw_pct > s_bat_pct_cached) {
+            s_bat_pct_cached += (raw_pct - s_bat_pct_cached > 5) ? 5 : (raw_pct - s_bat_pct_cached);
+        } else if (raw_pct < s_bat_pct_cached) {
+            s_bat_pct_cached -= (s_bat_pct_cached - raw_pct > 5) ? 5 : (s_bat_pct_cached - raw_pct);
+        }
     }
     if (++s_bat_tick >= 10) s_bat_tick = 0;
 
