@@ -25,4 +25,5 @@ idf_component_register(SRCS "dlna.c"
                         espressif__mdns
                         miplay
                         wifi_provision
+                        bat_monitor
                         libwebp)

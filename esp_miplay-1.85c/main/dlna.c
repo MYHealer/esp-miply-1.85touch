@@ -50,6 +50,8 @@
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "mdns.h"
+#include "esp_sntp.h"
+#include "bat_monitor.h"
 #define lodepng_malloc(s)    heap_caps_malloc(s, MALLOC_CAP_SPIRAM)
 #define lodepng_realloc(p,s) heap_caps_realloc(p, s, MALLOC_CAP_SPIRAM)
 #define lodepng_calloc(n,s)  heap_caps_calloc(n, s, MALLOC_CAP_SPIRAM)
@@ -258,6 +260,7 @@ static play_state_t get_state(void)
 typedef struct { int generation; } finish_arg_t;
 static void delayed_stop_notify(void *arg);
 static void schedule_delayed_stop_notify(void);
+void sntp_time_start(void);
 static void cb_play(void);
 static void cb_next(void);
 static void cb_previous(void);
@@ -2470,6 +2473,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "WiFi connected, IP: " IPSTR, IP2STR(&event->ip_info.ip));
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        /* 拿到 IP 后启动 SNTP 同步（内部幂等，重连不会重复创建） */
+        sntp_time_start();
         /* WiFi 恢复后自动恢复播放 */
         if (s_pipe && get_state() == PS_PAUSED && !s_user_stopped) {
             ESP_LOGI(TAG, "WiFi restored, resuming playback");
@@ -2480,8 +2485,37 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     }
 }
 
+/* ─────────────── SNTP 时间同步 ───────────────
+ * 状态栏时钟依赖本地 RTC；没同步时 time() 从 1970 起算，会显示错误时间。
+ * 拿到 IP 后启动 SNTP，首次同步成功后设置时区为 CST-8（中国标准时间）。
+ * 内部幂等：WiFi 重连重复调用不会重复创建。 */
+static bool s_sntp_started = false;
+
+static void sntp_time_sync_notification(struct timeval *tv)
+{
+    ESP_LOGI(TAG, "SNTP time synced");
+}
+
+void sntp_time_start(void)
+{
+    if (s_sntp_started) return;   /* esp_sntp_init() 会持续轮询，重连无需重启 */
+
+    setenv("TZ", "CST-8", 1);
+    tzset();
+
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    /* 使用阿里云 NTP + 备用池，国内可达性更好 */
+    esp_sntp_setservername(0, "ntp.aliyun.com");
+    esp_sntp_setservername(1, "pool.ntp.org");
+    esp_sntp_set_time_sync_notification_cb(sntp_time_sync_notification);
+    esp_sntp_init();
+    s_sntp_started = true;
+    ESP_LOGI(TAG, "SNTP started (TZ=CST-8)");
+}
+
 static void wifi_init(void)
 {
+    bat_monitor_init();
     s_wifi_event_group = xEventGroupCreate();
 
     ESP_ERROR_CHECK(esp_netif_init());

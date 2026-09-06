@@ -35,4 +35,4 @@ idf_component_register(SRCS "lvgl_port_disp.c" "lvgl_port_touch.c" "lvgl_port_ui
                     "ui_brookesia/esp_brookesia_app_icon_wlan_level3_36_36.c"
                     "ui_brookesia/esp_brookesia_app_icon_wlan_lock_48_48.c"
                     INCLUDE_DIRS "include" "../lvgl" "ui_ref"
-                    PRIV_REQUIRES tft_display lvgl echopal_board esp_driver_i2c esp_driver_gpio wifi_provision)
+                    PRIV_REQUIRES tft_display lvgl echopal_board esp_driver_i2c esp_driver_gpio wifi_provision bat_monitor)

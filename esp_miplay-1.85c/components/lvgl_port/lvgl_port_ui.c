@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <time.h>
+#include "bat_monitor.h"
 
 static const char *TAG = "LVGL_UI";
 
@@ -1201,7 +1202,6 @@ static void _update_system_status(void)
     if (hour == 0) hour = 12;
     lv_label_set_text_fmt(s_status_time_label, "%02d:%02d %s", hour, local_time.tm_min,
                           local_time.tm_hour >= 12 ? "PM" : "AM");
-
     wifi_ap_record_t ap = {0};
     bool connected = esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
     wifi_mode_t wifi_mode = WIFI_MODE_NULL;
@@ -1222,9 +1222,31 @@ static void _update_system_status(void)
     } else {
         lv_obj_clear_state(s_status_wifi_btn, LV_STATE_CHECKED);
     }
-    lv_img_set_src(s_status_battery_icon,
-                   &speaker_image_middle_quick_settings_battery_charge_20_20);
-    lv_label_set_text(s_status_battery_label, "100%");
+    /* 电量：真实 ADC 采样。状态栏 1s 刷新，但电池电压变化以分钟计，
+     * 这里 10s 才真正采一次，其余刷新复用缓存值，省电且避免 ADC 抖动。 */
+    static int s_bat_pct_cached = 0;
+    static bool s_bat_charging_cached = false;
+    static uint8_t s_bat_tick = 0;
+    if (s_bat_tick == 0) {
+        s_bat_pct_cached = bat_monitor_get_percent();
+        s_bat_charging_cached = bat_monitor_is_charging();
+    }
+    if (++s_bat_tick >= 10) s_bat_tick = 0;
+
+    const lv_img_dsc_t *bat_icon;
+    if (s_bat_charging_cached) {
+        bat_icon = &speaker_image_middle_quick_settings_battery_charge_20_20;
+    } else if (s_bat_pct_cached >= 75) {
+        bat_icon = &speaker_image_middle_quick_settings_battery_level4_20_20;
+    } else if (s_bat_pct_cached >= 50) {
+        bat_icon = &speaker_image_middle_quick_settings_battery_level3_20_20;
+    } else if (s_bat_pct_cached >= 25) {
+        bat_icon = &speaker_image_middle_quick_settings_battery_level2_20_20;
+    } else {
+        bat_icon = &speaker_image_middle_quick_settings_battery_level1_20_20;
+    }
+    lv_img_set_src(s_status_battery_icon, bat_icon);
+    lv_label_set_text_fmt(s_status_battery_label, "%d%%", s_bat_pct_cached);
     if (s_settings_wlan_status_label) {
         lv_label_set_text(s_settings_wlan_status_label, wlan_on ? "On" : "Off");
     }
