@@ -50,8 +50,10 @@
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "mdns.h"
-#define lodepng_malloc(s) heap_caps_malloc(s, MALLOC_CAP_SPIRAM)
-#define lodepng_free(p)  heap_caps_free(p)
+#define lodepng_malloc(s)    heap_caps_malloc(s, MALLOC_CAP_SPIRAM)
+#define lodepng_realloc(p,s) heap_caps_realloc(p, s, MALLOC_CAP_SPIRAM)
+#define lodepng_calloc(n,s)  heap_caps_calloc(n, s, MALLOC_CAP_SPIRAM)
+#define lodepng_free(p)      heap_caps_free(p)
 #include "libs/lodepng/lodepng.h"
 
 static const char *TAG = "DLNA_APP";
@@ -168,7 +170,7 @@ static volatile int    s_media_generation  = 0;   /* 媒体代数：每次新 UR
 static volatile int   s_album_art_gen = 0;  /* 封面任务代次，切歌时递增取消旧任务 */
 /* 封面 worker 任务：队列驱动 + PSRAM 栈（避免内部 SRAM 碎片导致任务创建失败） */
 #define ALBUM_ART_QUEUE_LEN 1
-#define ALBUM_ART_TASK_STACK_BYTES      (80U * 1024U)
+#define ALBUM_ART_TASK_STACK_BYTES      (256U * 1024U)
 #define DLNA_DELAYED_STOP_STACK_BYTES   (12U * 1024U)
 #define DLNA_UI_UPDATE_STACK_BYTES      (24U * 1024U)
 static QueueHandle_t  s_album_art_queue = NULL;
@@ -268,6 +270,7 @@ static void miplay_pipeline_start(void);
 static void miplay_pipeline_stop(void);
 static esp_gmf_err_t miplay_pipeline_event_cb(esp_gmf_event_pkt_t *event, void *ctx);
 static void fetch_album_art_async(const char *url);
+static void dlna_detach_miplay_if_active(void);
 
 static void schedule_delayed_stop_notify(void)
 {
@@ -371,7 +374,18 @@ static esp_gmf_err_t pipeline_event_cb(esp_gmf_event_pkt_t *event, void *ctx)
 /* ─────────────────────── DLNA 回调桥 ─────────────────────── */
 static bool is_video_uri(const char *uri);  /* forward decl */
 
-static const char *cb_get_transport_state(void) { return state_str(get_state()); }
+static const char *cb_get_transport_state(void)
+{
+    /* 宽限期内：切歌/seek 进行中，强制报告 PLAYING，防止手机 poll 看到中间状态
+     * （对齐 miair-next _play_grace_until 机制） */
+    if (esp_timer_get_time() < pos_load_i64(&s_grace_until)) {
+        play_state_t st = get_state();
+        if (st == PS_PLAYING || st == PS_STOPPED || st == PS_TRANSITIONING) {
+            return "PLAYING";
+        }
+    }
+    return state_str(get_state());
+}
 static const char *cb_get_uri(void)             { return s_track_uri ? s_track_uri : ""; }
 
 static int cb_get_position_sec(void)
@@ -502,7 +516,10 @@ static int cb_get_mute(void)   { return s_mute; }
  */
 static esp_err_t _my_vol_set(void *handle, int volume)
 {
-    if (!s_alc_el) return ESP_ERR_INVALID_STATE;
+    if (!s_alc_el) {
+        ESP_LOGW(TAG, "_my_vol_set: s_alc_el is NULL, volume=%d", volume);
+        return ESP_ERR_INVALID_STATE;
+    }
     int alc_gain;
     if (volume <= 0) {
         alc_gain = -64;
@@ -512,7 +529,7 @@ static esp_err_t _my_vol_set(void *handle, int volume)
         if (alc_gain < -64) alc_gain = -64;
     }
     esp_gmf_alc_set_gain_all(s_alc_el, (int8_t)alc_gain);
-    ESP_LOGD(TAG, "vol=%d -> alc_gain=%d", volume, alc_gain);
+    ESP_LOGI(TAG, "vol=%d -> alc_gain=%d", volume, alc_gain);
     return ESP_OK;
 }
 
@@ -855,14 +872,11 @@ static void cb_set_uri(const char *uri)
     s_user_stopped = 0;
     if (s_state_mux) xSemaphoreGive(s_state_mux);
     ESP_LOGI(TAG, "SetURI: %s", s_track_uri ? s_track_uri : "(null)");
-    /* 新 URI → 自动播放（不管当前是 STOPPED、PAUSED 还是 TRANSITIONING，新歌都要播） */
-    if (s_track_uri && s_pipe) {
-        play_state_t st = get_state();
-        if (st == PS_STOPPED || st == PS_PAUSED || st == PS_TRANSITIONING) {
-            ESP_LOGI(TAG, "Auto-play on SetURI (state=%d)", st);
-            cb_play();
-        }
-    }
+    /* 对齐 miair-next：SetAVTransportURI 只存储 URI，不自动播放。
+     * Play 是独立的 SOAP 调用，手机必须显式发 Play 才开始播放。
+     * 之前 auto-play 导致首次投屏时 SetURI→auto_play→Play→reset+run 重入，
+     * HTTP 连接损坏 → 首次失败。 */
+    dlna_detach_miplay_if_active();
 }
 
 /* ── 播完处理（参考 miair-next next_track()）──
@@ -894,6 +908,10 @@ static void _do_play(const char *uri, int seek_sec)
     s_media_generation++;
     s_near_end_count = 0;
     if (!s_pipe || !uri) return;
+
+    /* 宽限期：从 _do_play 入口就生效，覆盖管线重置→HTTP连接→run 全过程
+     * 防止手机 poll 在此窗口内读到 STOPPED 中间状态（对齐 miair-next） */
+    pos_store_i64(&s_grace_until, esp_timer_get_time() + 8000000LL);
 
     /* &amp; → & 解码：XML 实体只在送入 HTTP 管线时解码，
      * s_uri（GENA 通知用）保持原始 XML 编码不变 */
@@ -936,6 +954,16 @@ static void _do_play(const char *uri, int seek_sec)
     esp_gmf_pipeline_set_in_uri(s_pipe, uri);
     esp_gmf_pipeline_loading_jobs(s_pipe);
     esp_gmf_err_t err = esp_gmf_pipeline_run(s_pipe);
+    if (err != ESP_GMF_ERR_OK) {
+        /* 首次失败 → 重试一次（HTTP 连接偶发超时/CDN 拒绝后重连成功）
+         * 对齐 miair-next：无内置重试，但我们作为嵌入式设备需要更鲁棒 */
+        ESP_LOGW(TAG, "pipeline_run failed (%d), retrying...", err);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        esp_gmf_pipeline_reset(s_pipe);
+        esp_gmf_pipeline_set_in_uri(s_pipe, uri);
+        esp_gmf_pipeline_loading_jobs(s_pipe);
+        err = esp_gmf_pipeline_run(s_pipe);
+    }
     if (err == ESP_GMF_ERR_OK) {
         set_state(PS_PLAYING);
         s_accumulated_ms = seek_sec * 1000;
@@ -992,7 +1020,7 @@ static void cb_play(void)
         s_user_stopped = 0;
         pos_store_i64(&s_grace_until, esp_timer_get_time() + 1500000LL);
         esp_gmf_pipeline_stop(s_pipe);
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(300));
         _do_play(s_track_uri, s_saved_pos_sec);
         s_saved_pos_sec = 0;
         return;
@@ -1007,7 +1035,7 @@ static void cb_play(void)
             s_user_stopped = 0;
             pos_store_i64(&s_grace_until, esp_timer_get_time() + 1500000LL);
             esp_gmf_pipeline_stop(s_pipe);
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            vTaskDelay(pdMS_TO_TICKS(300));
             _do_play(s_track_uri, s_saved_pos_sec);
             s_saved_pos_sec = 0;
         } else {
@@ -1163,6 +1191,7 @@ static void cb_seek(int seconds)
 
 static void cb_set_volume(int v)
 {
+    ESP_LOGI(TAG, "SetVolume: %d (was %d, mute=%d, alc_el=%p)", v, s_vol, s_mute, s_alc_el);
     s_vol = v;
     if (s_mute) {
         s_mute = 0;
@@ -1226,8 +1255,8 @@ static void cb_next(void) {
         if (s_pipe) {
             esp_gmf_pipeline_stop(s_pipe);
         }
-        /* 增加延迟到 1.0s，确保完全停止播放并清空硬件缓存（对齐参考项目） */
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        /* 300ms 足够清空硬件缓存，比 1s 更快响应切歌 */
+        vTaskDelay(pdMS_TO_TICKS(300));
 
         /* 更新播放信息：next → current */
         free(s_track_uri);
@@ -1245,22 +1274,22 @@ static void cb_next(void) {
     } else {
         /* ── 无 next_uri：TRANSITIONING 等待手机下发 SetNextAVTransportURI ──
          * QQ 音乐切歌前会先发 SetNextAVTransportURI，但可能延迟。
-         * 设 TRANSITIONING 触发 UPnP 事件唤醒手机，最多等 10s。 */
+         * 设 TRANSITIONING 触发 UPnP 事件唤醒手机，最多等 5s。 */
         pos_store_i64(&s_grace_until, esp_timer_get_time() + 1000000LL);
         if (s_pipe) {
             esp_gmf_pipeline_stop(s_pipe);
         }
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(300));
 
         set_state(PS_TRANSITIONING);
         custom_dlna_notify_transport_state_async();
-        ESP_LOGI(TAG, "TRANSITIONING: waiting for next URI (max 10s)...");
+        ESP_LOGI(TAG, "TRANSITIONING: waiting for next URI (max 5s)...");
 
         int gen = s_media_generation;
         int waited = 0;
-        while (waited < 10000) {
-            vTaskDelay(pdMS_TO_TICKS(500));
-            waited += 500;
+        while (waited < 5000) {
+            vTaskDelay(pdMS_TO_TICKS(300));
+            waited += 300;
             /* 新 URI 到来（SetNextAVTransportURI 已写入 s_next_uri） */
             if (s_next_uri && s_next_uri[0]) {
                 ESP_LOGI(TAG, "TRANSITIONING: got next URI after %dms", waited);
@@ -1324,6 +1353,7 @@ static void cb_previous(void) {
     if (s_pipe && s_track_uri) {
         pos_store_i64(&s_grace_until, esp_timer_get_time() + 1000000LL);
         esp_gmf_pipeline_stop(s_pipe);
+        vTaskDelay(pdMS_TO_TICKS(300));
         _do_play(s_track_uri, 0);
     } else {
         if (s_pipe) esp_gmf_pipeline_stop(s_pipe);
@@ -1385,6 +1415,11 @@ static void cb_set_metadata(const char *metadata)
     /* 小米音箱模式：跳过元数据/歌词/封面，专注接收稳定性 */
     if (s_xiaomi_speaker_mode) {
         ESP_LOGD(TAG, "Metadata skipped (小米音箱模式)");
+        return;
+    }
+    /* MiPlay 模式：跳过 DLNA 元数据，防止覆盖 MiPlay 歌曲信息 */
+    if (s_miplay_connected) {
+        ESP_LOGD(TAG, "Metadata skipped (MiPlay active)");
         return;
     }
 
@@ -2511,6 +2546,11 @@ static void dlna_on_miplay_connected(bool connected)
     custom_dlna_set_ssdp_suppressed(connected);
     if (connected) {
         ESP_LOGI(TAG, "=== MiPlay connected → stopping DLNA pipeline, arming MiPlay GMF ===");
+        /* 清除 DLNA 元数据，防止旧歌信息残留在 UI */
+        s_cur_title[0] = '\0';
+        s_cur_artist[0] = '\0';
+        s_dur_cache_sec = 0;
+        s_media_generation++;
         /* 停 DLNA 管线（两个管线共用 I2S/codec_dev，不能同时输出） */
         if (s_pipe) {
             esp_gmf_pipeline_stop(s_pipe);

@@ -67,3 +67,11 @@ components/lvgl_port/ui_img_jiaopian_png.c
 temp_extract_*/
 *.png
 *.svg
+
+# Reference repos (cloned for protocol analysis)
+docs/reference/
+
+# Coredump files
+coredump_new.bin
+coredump_new.elf
+coredump_post_font.bin
