@@ -134,29 +134,111 @@ static lvgl_btn_cb_t s_cb_btn_prev = NULL;
 static lvgl_btn_cb_t s_cb_btn_play = NULL;
 static lvgl_btn_cb_t s_cb_btn_next = NULL;
 
-/* 按钮动作执行任务（独立栈，不阻塞 LVGL 任务） */
-static void _btn_action_task(void *arg)
+/* 按钮动作：按下即入队，常驻任务执行（避免每次点击动态建/删任务）。
+ *
+ * 关键：拆成两条独立队列/worker。切歌（prev/next）在无 next_uri 时会在
+ * cb_next() 内部等待手机下发 URI 最多 5 秒；若与播放/暂停共用同一个
+ * worker，切歌期间暂停会被排队阻塞，手感像死机。两条队列各自串行，
+ * 互不影响。 */
+typedef enum {
+    BTN_ACT_PREV = 1,
+    BTN_ACT_PLAY,
+    BTN_ACT_NEXT,
+} btn_action_t;
+
+#define BTN_QUEUE_LEN 4
+
+static QueueHandle_t s_btn_queue_ctrl;  /* play/pause —— 快路径 */
+static QueueHandle_t s_btn_queue_track; /* prev/next  —— 慢路径（含等待） */
+
+static StaticTask_t  s_btn_ctrl_tcb;
+static StaticTask_t  s_btn_track_tcb;
+static StackType_t  *s_btn_ctrl_stack = NULL;
+static StackType_t  *s_btn_track_stack = NULL;
+
+/* 切歌按下序号：每次 prev/next 入队时自增。
+ * dlna.c 的切歌等待循环会检查它——用户又按了就立刻放弃旧等待，
+ * 让新命令马上执行，避免"切歌后 5 秒内按什么都没反应"。 */
+static volatile uint32_t s_btn_track_seq = 0;
+
+uint32_t lvgl_port_ui_track_seq(void)
 {
-    lvgl_btn_cb_t cb = (lvgl_btn_cb_t)arg;
-    if (cb) cb();
-    lvgl_ui_delete_current_task();
+    return s_btn_track_seq;
 }
 
-/* 按钮点击事件处理 */
-static void _btn_click_cb(lv_event_t *e)
+static void btn_dispatch(btn_action_t act)
+{
+    lvgl_btn_cb_t cb = NULL;
+    if (act == BTN_ACT_PREV)      cb = s_cb_btn_prev;
+    else if (act == BTN_ACT_PLAY) cb = s_cb_btn_play;
+    else if (act == BTN_ACT_NEXT) cb = s_cb_btn_next;
+    if (cb) cb();
+}
+
+/* 常驻按钮任务：绑核0 + 高优先级（核1被 MiPlay media task 占满） */
+static void _btn_worker_task(void *arg)
+{
+    QueueHandle_t q = (QueueHandle_t)arg;
+    btn_action_t act;
+    while (1) {
+        if (xQueueReceive(q, &act, portMAX_DELAY) == pdTRUE) {
+            btn_dispatch(act);
+        }
+    }
+}
+
+static void _btn_start_worker(QueueHandle_t q, const char *name,
+                              StaticTask_t *tcb, StackType_t **stack)
+{
+    if (!q) return;
+    if (!*stack) {
+        *stack = heap_caps_malloc(LVGL_BTN_ACTION_STACK_BYTES, MALLOC_CAP_SPIRAM);
+    }
+    if (!*stack) {
+        ESP_LOGE(TAG, "%s stack alloc failed", name);
+        return;
+    }
+    /* TCB 必须 memset（内部 RAM，不能放 PSRAM） */
+    memset(tcb, 0, sizeof(*tcb));
+    if (!xTaskCreateStaticPinnedToCore(
+            _btn_worker_task, name,
+            LVGL_BTN_ACTION_STACK_BYTES / sizeof(StackType_t), (void *)q,
+            6, *stack, tcb, 0)) {
+        ESP_LOGE(TAG, "%s create failed", name);
+    }
+}
+
+static void _btn_worker_start(void)
+{
+    if (s_btn_queue_ctrl) return;
+    s_btn_queue_ctrl  = xQueueCreate(BTN_QUEUE_LEN, sizeof(btn_action_t));
+    s_btn_queue_track = xQueueCreate(BTN_QUEUE_LEN, sizeof(btn_action_t));
+    if (!s_btn_queue_ctrl || !s_btn_queue_track) {
+        ESP_LOGE(TAG, "btn queue create failed");
+        return;
+    }
+    _btn_start_worker(s_btn_queue_ctrl,  "btn_ctrl",
+                      &s_btn_ctrl_tcb,  &s_btn_ctrl_stack);
+    _btn_start_worker(s_btn_queue_track, "btn_track",
+                      &s_btn_track_tcb, &s_btn_track_stack);
+}
+
+/* 按下即响应（PRESSED 而非 CLICKED）：手指微动不会被判为拖拽而丢失点击 */
+static void _btn_press_cb(lv_event_t *e)
 {
     lv_obj_t *btn = lv_event_get_target(e);
-    lvgl_btn_cb_t cb = NULL;
-    if (btn == s_btn_prev) cb = s_cb_btn_prev;
-    else if (btn == s_btn_play) cb = s_cb_btn_play;
-    else if (btn == s_btn_next) cb = s_cb_btn_next;
+    btn_action_t act = 0;
+    QueueHandle_t q = NULL;
+    if (btn == s_btn_prev)      { act = BTN_ACT_PREV; q = s_btn_queue_track; }
+    else if (btn == s_btn_play) { act = BTN_ACT_PLAY; q = s_btn_queue_ctrl;  }
+    else if (btn == s_btn_next) { act = BTN_ACT_NEXT; q = s_btn_queue_track; }
+    else return;
 
-    /* 在独立任务中执行回调，不阻塞 LVGL 任务 */
-    if (cb) {
-        lvgl_ui_create_task(_btn_action_task, "btn_act",
-                            LVGL_BTN_ACTION_STACK_BYTES, (void*)cb, 6, 1);
+    /* 只投递，绝不阻塞 LVGL 任务；队列满时丢弃（用户会再按） */
+    if (q) {
+        if (q == s_btn_queue_track) s_btn_track_seq++;
+        xQueueSend(q, &act, 0);
     }
-
 }
 
 /* 封面点击 → 切换歌词界面 */
@@ -309,10 +391,40 @@ static void _system_button_event_cb(lv_event_t *event);
 #define UI_BTN_PLAY_SIZE    42
 #define UI_BTN_SIDE_SIZE    36
 #define UI_BUTTON_GAP       18
-#define UI_BUTTON_CLICK_PAD 6
-/* 上下首按钮触摸热区更大（36px 按钮太小，手指容易偏） */
-#define UI_BUTTON_CLICK_PAD_SIDE 14
+#define UI_BUTTON_CLICK_PAD 8
+/* 侧边按钮点击区 10px（14px 会与 Play 按钮重叠 2px，导致误触） */
+#define UI_BUTTON_CLICK_PAD_SIDE 10
 #define UI_BUTTON_CENTER_Y  316
+/* 侧边按钮向屏幕外侧额外扩展的宽度（手指容易偏到按钮外侧） */
+#define UI_BUTTON_EXTRA_OUTWARD 26
+
+/* 非对称外扩热区：direction=-1 向左扩（prev），+1 向右扩（next）。
+ * ext_click_area 只能四周对称扩展，无法只扩外侧，故用透明容器补一段。 */
+static void _hotzone_press_cb(lv_event_t *e)
+{
+    btn_action_t act = (btn_action_t)(intptr_t)lv_event_get_user_data(e);
+    QueueHandle_t q = (act == BTN_ACT_PLAY) ? s_btn_queue_ctrl : s_btn_queue_track;
+    if (!q) return;
+    if (q == s_btn_queue_track) s_btn_track_seq++;
+    xQueueSend(q, &act, 0);
+}
+
+static void _create_outward_hotzone(lv_obj_t *parent, lv_obj_t *btn,
+                                    btn_action_t act, int direction)
+{
+    lv_obj_t *zone = lv_obj_create(parent);
+    lv_obj_remove_style_all(zone);
+    lv_obj_set_style_bg_opa(zone, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(zone, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(zone, UI_BUTTON_EXTRA_OUTWARD,
+                    UI_BTN_SIDE_SIZE + 2 * UI_BUTTON_CLICK_PAD_SIDE);
+    lv_obj_align_to(zone, btn, direction < 0 ? LV_ALIGN_OUT_LEFT_MID
+                                             : LV_ALIGN_OUT_RIGHT_MID, 0, 0);
+    lv_obj_add_event_cb(zone, _hotzone_press_cb, LV_EVENT_PRESSED,
+                        (void *)(intptr_t)act);
+    /* 热区放最底层，不遮挡按钮自身的按压反馈 */
+    lv_obj_move_background(zone);
+}
 
 static void _style_screen(lv_obj_t *screen)
 {
@@ -1616,7 +1728,10 @@ void lvgl_port_ui_create(void)
     lv_obj_set_style_text_font(s_label_time2, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_align(s_label_time2, LV_TEXT_ALIGN_RIGHT, 0);
 
-    /* ====== 控制按钮 ====== */
+    /* ====== 控制按钮 ======
+     * 侧边按钮用透明热区容器实现非对称扩展：外侧多扩（手指容易偏到屏幕外），
+     * 内侧少扩（避免侵入 Play 区域导致误触切歌）。
+     * lv_obj_set_ext_click_area 只能四周对称扩展，做不到这一点。 */
     s_btn_prev = lv_imgbtn_create(scr);
     lv_imgbtn_set_src(s_btn_prev, LV_IMGBTN_STATE_RELEASED, NULL, &ui_img_shangyi1_png, NULL);
     lv_obj_set_pos(s_btn_prev,
@@ -1641,6 +1756,11 @@ void lvgl_port_ui_create(void)
     lv_obj_set_size(s_btn_next, UI_BTN_SIDE_SIZE, UI_BTN_SIDE_SIZE);
     lv_obj_set_ext_click_area(s_btn_next, UI_BUTTON_CLICK_PAD_SIDE);
 
+    /* 非对称外扩热区：prev 向左、next 向右各加 UI_BUTTON_EXTRA_OUTWARD px。
+     * 事件转发到对应按钮，自身完全透明不可见。 */
+    _create_outward_hotzone(scr, s_btn_prev, BTN_ACT_PREV, -1);
+    _create_outward_hotzone(scr, s_btn_next, BTN_ACT_NEXT, +1);
+
     /* 按压反馈：按下时变暗，松开恢复（替代 scale，性能更优） */
     static lv_style_transition_dsc_t press_tr;
     static lv_style_prop_t press_props[] = { LV_STYLE_OPA, (lv_style_prop_t)0 };
@@ -1655,10 +1775,11 @@ void lvgl_port_ui_create(void)
     lv_obj_set_style_opa(s_btn_play, LV_OPA_70, LV_STATE_PRESSED);
     lv_obj_set_style_opa(s_btn_next, LV_OPA_70, LV_STATE_PRESSED);
 
-    /* 点击回调 */
-    lv_obj_add_event_cb(s_btn_prev, _btn_click_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_event_cb(s_btn_play, _btn_click_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_event_cb(s_btn_next, _btn_click_cb, LV_EVENT_CLICKED, NULL);
+    /* 按下即触发（PRESSED）：不受手指微动影响，响应最快 */
+    lv_obj_add_event_cb(s_btn_prev, _btn_press_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(s_btn_play, _btn_press_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(s_btn_next, _btn_press_cb, LV_EVENT_PRESSED, NULL);
+    _btn_worker_start();
 
     /* 点击封面图 → 切到歌词界面 */
     lv_obj_add_event_cb(s_cover_container, _cover_click_cb, LV_EVENT_CLICKED, NULL);

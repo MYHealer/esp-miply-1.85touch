@@ -41,7 +41,11 @@ void miplay_set_connected_cb(miplay_connected_cb_t cb);
 #define MIPLAY_MEDIA_CHANGED_STATUS        (1U << 8)
 #define MIPLAY_MEDIA_CHANGED_DEVICE_STATE  (1U << 9)
 #define MIPLAY_MEDIA_CHANGED_PLAYER_STATE  (1U << 10)
-#define MIPLAY_COVER_SOURCE_MAX             49152
+/* 封面 base64 载体上限。必须 ≥ 帧上限 64KB：
+ * 帧能装下的 payload，cover_url 解析也必须装得下——
+ * miplay_json_copy_string 在目标缓冲装不下时直接失败（不是截断），
+ * 缓冲偏小会让大封面歌曲的 cover_url 保持为空，封面不显示。 */
+#define MIPLAY_COVER_SOURCE_MAX             (64U * 1024U)
 
 #define MIPLAY_PLAYER_STATE_UNKNOWN  (-1)
 #define MIPLAY_PLAYER_STATE_STOPPED   0

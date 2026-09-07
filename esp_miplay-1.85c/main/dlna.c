@@ -263,6 +263,10 @@ static void delayed_stop_notify(void *arg);
 static void schedule_delayed_stop_notify(void);
 void sntp_time_start(void);
 static void start_charge_monitor(void);
+/* UI 刷新任务句柄：按钮按下时通知它立刻刷新（避免等满 40ms 轮询周期）。
+ * 声明前置——按钮回调在文件中部就要用到它。 */
+
+static TaskHandle_t s_ui_update_task = NULL;
 static void cb_play(void);
 static void cb_next(void);
 static void cb_previous(void);
@@ -1091,15 +1095,69 @@ static void cb_pause(void)
     }
 }
 
+/* ══ MiPlay 反控发送 worker ══
+ * 与 DLNA 不同，MiPlay 切歌/暂停只是给手机发一条命令，接收端不本地切歌
+ * （见记忆 miplay-reverse-control-protocol）。
+ * 发送要抢 session/send 两把锁，控制任务持锁时可能等很久；若在按钮任务里
+ * 同步发，按钮就会卡住。故按钮只投递动作，由本 worker 异步发送。 */
+typedef enum {
+    MIPLAY_CMD_PAUSE = 1,
+    MIPLAY_CMD_PLAY,
+    MIPLAY_CMD_PREV,
+    MIPLAY_CMD_NEXT,
+} miplay_cmd_t;
+
+static QueueHandle_t s_miplay_cmd_queue;
+
+static void miplay_cmd_worker(void *arg)
+{
+    (void)arg;
+    miplay_cmd_t cmd;
+    while (1) {
+        if (xQueueReceive(s_miplay_cmd_queue, &cmd, portMAX_DELAY) != pdTRUE) continue;
+        switch (cmd) {
+            case MIPLAY_CMD_PAUSE: miplay_send_receiver_control("pause", 0); break;
+            case MIPLAY_CMD_PLAY:  miplay_send_receiver_control("play", 0);  break;
+            case MIPLAY_CMD_PREV:  miplay_send_receiver_control("prev", 0);  break;
+            case MIPLAY_CMD_NEXT:  miplay_send_receiver_control("next", 0);  break;
+            default: break;
+        }
+    }
+}
+
+static void miplay_cmd_post(miplay_cmd_t cmd)
+{
+    if (!s_miplay_cmd_queue) {
+        s_miplay_cmd_queue = xQueueCreate(8, sizeof(miplay_cmd_t));
+        if (s_miplay_cmd_queue) {
+            dlna_create_task(miplay_cmd_worker, "miplay_cmd",
+                             DLNA_UI_UPDATE_STACK_BYTES, NULL, 5, NULL, 0);
+        }
+    }
+    if (s_miplay_cmd_queue) xQueueSend(s_miplay_cmd_queue, &cmd, 0);
+}
+
 /* ── 播放/暂停切换 ── */
 static void cb_play_toggle(void)
 {
-    /* MiPlay 模式：转发 play/pause 给手机 */
+    /* MiPlay 模式：只翻转本地状态镜像，UI 由 ui_update_task 串行刷新。
+     * 绝不在这里调 lvgl_port_ui_set_state()——本函数运行在按钮任务，
+     * 与持锁的 ui_update_task 并发改 LVGL 动画链表会让画面卡死。 */
     if (s_miplay_connected) {
-        play_state_t cur = get_state();
-        const char *action = (cur == PS_PLAYING) ? "pause" : "play";
-        ESP_LOGI(TAG, "[MiPlay] -> %s", action);
-        miplay_send_receiver_control(action, 0);
+        play_state_t cur = (play_state_t)s_miplay_state;
+        if (cur == PS_PLAYING) {
+            s_miplay_state = PS_PAUSED;
+            ESP_LOGI(TAG, "[MiPlay] -> pause (local mirror)");
+            miplay_cmd_post(MIPLAY_CMD_PAUSE);
+        } else {
+            s_miplay_state = PS_PLAYING;
+            s_miplay_position_anchor_us = esp_timer_get_time()
+                                          - (int64_t)s_miplay_position_ms * 1000LL;
+            ESP_LOGI(TAG, "[MiPlay] -> play (local mirror)");
+            miplay_cmd_post(MIPLAY_CMD_PLAY);
+        }
+        /* 唤醒 UI 任务立刻刷新图标（它自己持 LVGL 锁，线程安全） */
+        if (s_ui_update_task) xTaskNotifyGive(s_ui_update_task);
         return;
     }
     play_state_t cur = get_state();
@@ -1237,10 +1295,16 @@ static bool is_video_uri(const char *uri)
 
 /* Next — 严格对齐 miair-next next_track() 流程 */
 static void cb_next(void) {
-    /* MiPlay 模式：转发 next 给手机，不脱离 MiPlay */
+    /* MiPlay 模式：转发 next 给手机，不脱离 MiPlay。
+     * 本地镜像立刻进入 TRANSITIONING，避免 UI 停在旧歌进度上显得没反应。 */
     if (s_miplay_connected) {
         ESP_LOGI(TAG, "[MiPlay] -> key-next");
-        miplay_send_receiver_control("next", 0);
+        s_miplay_state = PS_TRANSITIONING;
+        s_miplay_position_ms = 0;
+        s_miplay_duration_ms = 0;
+        s_miplay_position_anchor_us = 0;
+        miplay_cmd_post(MIPLAY_CMD_NEXT);
+        if (s_ui_update_task) xTaskNotifyGive(s_ui_update_task);
         return;
     }
     ESP_LOGI(TAG, "Next (next_uri=%s) state=%d", s_next_uri ? s_next_uri : "(null)", (int)get_state());
@@ -1291,10 +1355,12 @@ static void cb_next(void) {
         ESP_LOGI(TAG, "TRANSITIONING: waiting for next URI (max 5s)...");
 
         int gen = s_media_generation;
+        /* 记录本次切歌的按键序号：期间用户再按就放弃等待，让新命令立刻执行 */
+        uint32_t my_seq = lvgl_port_ui_track_seq();
         int waited = 0;
         while (waited < 5000) {
-            vTaskDelay(pdMS_TO_TICKS(300));
-            waited += 300;
+            vTaskDelay(pdMS_TO_TICKS(100));
+            waited += 100;
             /* 新 URI 到来（SetNextAVTransportURI 已写入 s_next_uri） */
             if (s_next_uri && s_next_uri[0]) {
                 ESP_LOGI(TAG, "TRANSITIONING: got next URI after %dms", waited);
@@ -1308,6 +1374,11 @@ static void cb_next(void) {
             /* 检测播放是否已被 SetAVTransportURI → cb_play 启动 */
             if (get_state() == PS_PLAYING) {
                 ESP_LOGI(TAG, "TRANSITIONING: already playing (SetAVTransportURI), abort");
+                return;
+            }
+            /* 用户又按了切歌键：放弃本次等待，让新命令立刻执行 */
+            if (lvgl_port_ui_track_seq() != my_seq) {
+                ESP_LOGI(TAG, "TRANSITIONING: superseded by new track press, abort");
                 return;
             }
         }
@@ -1344,7 +1415,12 @@ static void cb_previous(void) {
     /* MiPlay 模式：转发 prev 给手机，不脱离 MiPlay */
     if (s_miplay_connected) {
         ESP_LOGI(TAG, "[MiPlay] -> key-prev");
-        miplay_send_receiver_control("prev", 0);
+        s_miplay_state = PS_TRANSITIONING;
+        s_miplay_position_ms = 0;
+        s_miplay_duration_ms = 0;
+        s_miplay_position_anchor_us = 0;
+        miplay_cmd_post(MIPLAY_CMD_PREV);
+        if (s_ui_update_task) xTaskNotifyGive(s_ui_update_task);
         return;
     }
     s_media_generation++;
@@ -1486,6 +1562,11 @@ static void cb_set_metadata(const char *metadata)
 /* ─────────────────────── 专辑封面下载与解码 ─────────────────────── */
 
 /* ── HTTPS 封面下载（esp_http_client 支持 TLS）── */
+/* ── 封面下载缓冲区（MiPlay 大封面可达数百 KB，初始给足避免频繁 realloc）── */
+#define COVER_HTTP_INITIAL_CAP  (512 * 1024)   /* 初始 512KB */
+#define COVER_HTTP_GROW_STEP    (512 * 1024)   /* 每次扩 512KB */
+#define COVER_HTTP_MAX_CAP      (4 * 1024 * 1024) /* 上限 4MB，防止异常响应吃光 PSRAM */
+
 static int https_get_cover(const char *url, uint8_t **out_data, int *out_len)
 {
     esp_http_client_config_t cfg = {
@@ -1512,9 +1593,10 @@ static int https_get_cover(const char *url, uint8_t **out_data, int *out_len)
         return -1;
     }
 
-    /* 分配 PSRAM 缓冲区读取响应 */
-    int cap = (content_length > 0) ? content_length + 256 : 256 * 1024;
-    uint8_t *buf = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+    /* 分配 PSRAM 缓冲区读取响应。必须带 MALLOC_CAP_8BIT——只给 SPIRAM 时
+     * realloc 可能返回非字节可寻址的块，导致后续 JPEG 解码读到错位数据。 */
+    int cap = (content_length > 0) ? content_length + 256 : COVER_HTTP_INITIAL_CAP;
+    uint8_t *buf = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!buf) {
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
@@ -1525,8 +1607,13 @@ static int https_get_cover(const char *url, uint8_t **out_data, int *out_len)
     while ((r = esp_http_client_read(client, (char *)buf + total, cap - total)) > 0) {
         total += r;
         if (total > cap - 4096) {
-            int new_cap = cap + 128 * 1024;
-            uint8_t *new_buf = heap_caps_realloc(buf, new_cap, MALLOC_CAP_SPIRAM);
+            if (cap >= COVER_HTTP_MAX_CAP) {
+                ESP_LOGW(TAG, "Cover too large, truncated at %d bytes", total);
+                break;
+            }
+            int new_cap = cap + COVER_HTTP_GROW_STEP;
+            uint8_t *new_buf = heap_caps_realloc(buf, new_cap,
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
             if (!new_buf) break;
             buf = new_buf;
             cap = new_cap;
@@ -1601,9 +1688,10 @@ static int simple_http_get(const char *url, uint8_t **out_data, int *out_len)
         "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", path, host);
     send(sock, req, req_len, 0);
 
-    /* 读取响应到 PSRAM 缓冲区（动态扩容，确保完整下载） */
-    int cap = 256 * 1024;  /* 初始 256KB，足够大图 */
-    uint8_t *buf = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+    /* 读取响应到 PSRAM 缓冲区（动态扩容，确保完整下载）。
+     * 必须带 MALLOC_CAP_8BIT：只给 SPIRAM 时 realloc 可能返回非字节可寻址块。 */
+    int cap = COVER_HTTP_INITIAL_CAP;
+    uint8_t *buf = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!buf) { close(sock); return -1; }
 
     int total = 0, hdr_end = 0;
@@ -1622,9 +1710,17 @@ static int simple_http_get(const char *url, uint8_t **out_data, int *out_len)
         }
         /* 缓冲区将满时扩容（PSRAM 有足够空间） */
         if (total > cap - 4096) {
-            int new_cap = cap + 128 * 1024;
-            uint8_t *new_buf = heap_caps_realloc(buf, new_cap, MALLOC_CAP_SPIRAM);
-            if (!new_buf) break;  /* 扩容失败，用已有数据 */
+            if (cap >= COVER_HTTP_MAX_CAP) {
+                ESP_LOGW(TAG, "Cover too large, truncated at %d bytes", total);
+                break;
+            }
+            int new_cap = cap + COVER_HTTP_GROW_STEP;
+            uint8_t *new_buf = heap_caps_realloc(buf, new_cap,
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!new_buf) {
+                ESP_LOGW(TAG, "Cover buffer grow failed at %d bytes", total);
+                break;  /* 扩容失败，用已有数据 */
+            }
             buf = new_buf;
             cap = new_cap;
         }
@@ -1639,8 +1735,8 @@ static int simple_http_get(const char *url, uint8_t **out_data, int *out_len)
 
     int body_len = total - hdr_end;
     ESP_LOGI(TAG, "HTTP response: total=%d, headers=%d, body=%d", total, hdr_end, body_len);
-    /* 分配干净的 body 缓冲区（PSRAM） */
-    uint8_t *body = heap_caps_malloc(body_len, MALLOC_CAP_SPIRAM);
+    /* 分配干净的 body 缓冲区（PSRAM，必须带 8BIT） */
+    uint8_t *body = heap_caps_malloc(body_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!body) { heap_caps_free(buf); return -1; }
     memcpy(body, buf + hdr_end, body_len);
     heap_caps_free(buf);
@@ -1680,7 +1776,7 @@ static int decode_base64_cover(const char *source, uint8_t **out_data, int *out_
         return -1;
     }
     size_t capacity = (encoded_len * 3) / 4 + 4;
-    uint8_t *decoded = heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM);
+    uint8_t *decoded = heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!decoded) return -1;
     size_t decoded_len = 0;
     int ret = mbedtls_base64_decode(decoded, capacity, &decoded_len,
@@ -1963,6 +2059,11 @@ static void fetch_album_art_async(const char *url)
     if (!url || !s_album_art_queue) return;
     char *url_copy = strdup_psram(url);
     if (!url_copy) return;
+    /* 覆盖式发送前必须先取出（并释放）队列里尚未被取走的旧指针。
+     * xQueueOverwrite 会无声丢弃旧指针导致内存泄漏；更要紧的是切歌频繁时
+     * 旧 URL 可能还没被 worker 取走就被覆盖，那次封面请求就彻底丢失了。 */
+    char *stale = NULL;
+    if (xQueueReceive(s_album_art_queue, &stale, 0) == pdTRUE) free(stale);
     s_album_art_gen++;  /* 递增代次，worker 检测到 gen 变化会放弃旧请求 */
     ESP_LOGI(TAG, "Cover queued: len=%u %.160s (gen=%d)",
              (unsigned)strlen(url), url, s_album_art_gen);
@@ -2300,8 +2401,10 @@ static void ui_update_task(void *arg)
     int last_cur_line = -1;
     while (1) {
         play_state_t ui_state = s_miplay_connected ? (play_state_t)s_miplay_state : get_state();
-        /* 空闲态降频到 2Hz，播放态保持 25Hz */
-        vTaskDelay(pdMS_TO_TICKS((ui_state == PS_PLAYING || ui_state == PS_PAUSED) ? 40 : 500));
+        /* 空闲态降频到 2Hz，播放态保持 25Hz。
+         * 用 TaskNotify 等待：按钮按下时立刻唤醒刷新，不必等满 40ms。 */
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(
+            (ui_state == PS_PLAYING || ui_state == PS_PAUSED) ? 40 : 500));
 
         lvgl_port_lock();
 
@@ -2756,5 +2859,5 @@ void app_main(void)
         ESP_LOGE(TAG, "miplay_init failed: %s", esp_err_to_name(miplay_ret));
     }
     dlna_create_task(ui_update_task, "ui_update",
-                     DLNA_UI_UPDATE_STACK_BYTES, NULL, 3, NULL, 0);
+                     DLNA_UI_UPDATE_STACK_BYTES, NULL, 3, &s_ui_update_task, 0);
 }

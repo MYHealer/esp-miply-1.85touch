@@ -82,6 +82,14 @@ void lvgl_port_ui_register_btn_prev_cb(lvgl_btn_cb_t cb);
 void lvgl_port_ui_register_btn_play_cb(lvgl_btn_cb_t cb);
 void lvgl_port_ui_register_btn_next_cb(lvgl_btn_cb_t cb);
 
+/**
+ * @brief 切歌键按下序号（每次 prev/next 入队自增）
+ *
+ * 切歌等待循环用它在"用户又按了"时立刻放弃旧等待，让新命令马上执行，
+ * 避免切歌后数秒内按键无响应。
+ */
+uint32_t lvgl_port_ui_track_seq(void);
+
 #ifdef __cplusplus
 }
 #endif

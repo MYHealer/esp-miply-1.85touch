@@ -5145,10 +5145,14 @@ void miplay_send_receiver_control(const char *action, int64_t value)
     bool is_resume = strcmp(action, "resume") == 0 || strcmp(action, "play") == 0;
     if (is_pause) miplay_set_audio_paused(true, "local receiver control");
     else if (is_resume) miplay_set_audio_paused(false, "local receiver control");
-    if (s_session_mux) xSemaphoreTake(s_session_mux, portMAX_DELAY);
+    if (!s_session_mux || !s_send_mux) return;
+    if (xSemaphoreTake(s_session_mux, portMAX_DELAY) != pdTRUE) return;
     miplay_session_t *session = miplay_session_active_locked();
     if (session) miplay_session_load(session);
-    if (s_send_mux) xSemaphoreTake(s_send_mux, portMAX_DELAY);
+    if (xSemaphoreTake(s_send_mux, portMAX_DELAY) != pdTRUE) {
+        xSemaphoreGive(s_session_mux);
+        return;
+    }
     int sock = session ? session->sock : -1;
     bool can_send = sock >= 0 && session && session->in_use &&
                     session->media_session_opened && s_has_session_key;

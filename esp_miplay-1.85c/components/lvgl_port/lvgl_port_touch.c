@@ -137,9 +137,8 @@ static void touch_sample_task(void *arg)
          * 纯边沿触发会错过第一条边沿导致触摸永远不响应。 */
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
         touch_poll();
-        /* 心跳：3 秒一条，确认任务活着并暴露芯片原始状态字节。
-         * 读 0x00 起 16 字节覆盖 GESTURE/TOUCH_FLAGS 等，定位数据布局。 */
-        if ((++loops % 150) == 0) {
+        /* 心跳：10 秒一条，确认任务活着（放在 poll 之后，不阻塞触摸读取） */
+        if ((++loops % 500) == 0) {
             uint8_t base_reg = 0x00;
             uint8_t dump[16] = {0};
             esp_err_t err = i2c_master_transmit_receive(s_touch_device, &base_reg, 1,
@@ -237,7 +236,7 @@ esp_err_t lvgl_port_touch_init(lv_display_t *disp)
 
     /* 内部 SRAM 栈（PSRAM 栈 + flash 操作 = 断言崩溃）*/
     BaseType_t task_ret = xTaskCreatePinnedToCore(
-        touch_sample_task, "touch_sample", TOUCH_SAMPLE_STACK_BYTES, NULL, 5,
+        touch_sample_task, "touch_sample", TOUCH_SAMPLE_STACK_BYTES, NULL, 6,
         &s_touch_task, 0);
     if (task_ret != pdPASS) {
         ESP_LOGE(TAG, "CST816S sampling task creation failed");

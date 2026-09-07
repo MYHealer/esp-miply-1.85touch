@@ -230,7 +230,7 @@ bool bat_monitor_is_charging(void)
      *
      * 策略：用 EMA 滤波后的电压变化趋势判断——
      *   - 电压上升或持平 → "充电中"
-     *   - 电压连续下降超过 8mV → "未充电"（拔线了）
+     *   - 电压连续下降超过 4mV → "未充电"（拔线了）
      *
      * 这样满电插着USB时保持充电图标，拔线后约 3~5 秒切换。
      */
@@ -277,8 +277,8 @@ bool bat_monitor_is_charging(void)
         /* 电压下降 */
         s_drop_count++;
         int drop = s_peak_mv - mv;
-        if (drop >= 8 && s_drop_count >= 2) {
-            /* 连续下降超过 8mV → 判定拔线 */
+        if (drop >= 4 && s_drop_count >= 2) {
+            /* 连续下降超过 4mV → 判定拔线 */
             if (s_state) {
                 s_state = false;
                 ESP_LOGI(TAG, "charging -> 0 (%dmV, drop %dmV from peak)", mv, drop);
