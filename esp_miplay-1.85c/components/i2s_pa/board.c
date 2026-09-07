@@ -175,6 +175,24 @@ esp_err_t audio_out_resume(void)
     return ret;
 }
 
+int audio_out_get_rate(void)
+{
+    if (!s_initialized) return 0;
+    if (s_audio_mux) xSemaphoreTake(s_audio_mux, portMAX_DELAY);
+    int rate = s_current_rate;
+    if (s_audio_mux) xSemaphoreGive(s_audio_mux);
+    return rate;
+}
+
+int audio_out_get_ch(void)
+{
+    if (!s_initialized) return 0;
+    if (s_audio_mux) xSemaphoreTake(s_audio_mux, portMAX_DELAY);
+    int ch = s_current_ch;
+    if (s_audio_mux) xSemaphoreGive(s_audio_mux);
+    return ch;
+}
+
 esp_err_t audio_out_write(const void *data, size_t size,
                           size_t *bytes_written, uint32_t timeout_ms)
 {

@@ -26,4 +26,5 @@ idf_component_register(SRCS "dlna.c"
                         miplay
                         wifi_provision
                         bat_monitor
+                        chime
                         libwebp)

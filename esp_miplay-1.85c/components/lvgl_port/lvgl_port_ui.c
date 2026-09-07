@@ -762,7 +762,7 @@ static void _create_system_ui(void)
     s_status_panel = lv_obj_create(layer);
     lv_obj_remove_style_all(s_status_panel);
     lv_obj_set_size(s_status_panel, TFT_W, STATUS_PANEL_H);
-    lv_obj_set_pos(s_status_panel, -1, STATUS_PANEL_HIDDEN_Y);
+    lv_obj_set_pos(s_status_panel, 0, STATUS_PANEL_HIDDEN_Y);
     lv_obj_set_flex_flow(s_status_panel, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(s_status_panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
@@ -779,8 +779,8 @@ static void _create_system_ui(void)
     lv_obj_remove_style_all(status);
     lv_obj_set_width(status, lv_pct(100));
     lv_obj_set_height(status, LV_SIZE_CONTENT);
-    lv_obj_set_x(status, 1);
-    lv_obj_set_y(status, -1);
+    lv_obj_set_x(status, 0);
+    lv_obj_set_y(status, 0);
     lv_obj_set_align(status, LV_ALIGN_TOP_MID);
     lv_obj_set_style_pad_left(status, 0, 0);
     lv_obj_set_style_pad_right(status, 0, 0);
@@ -802,14 +802,14 @@ static void _create_system_ui(void)
     lv_obj_remove_style_all(status_top);
     lv_obj_set_width(status_top, lv_pct(97));
     lv_obj_set_height(status_top, LV_SIZE_CONTENT);
-    lv_obj_set_x(status_top, -1);
+    lv_obj_set_x(status_top, 0);
     lv_obj_set_align(status_top, LV_ALIGN_CENTER);
     lv_obj_clear_flag(status_top, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
 
     s_status_time_label = _create_text(status_top, "12:00 AM",
                                        &esp_brookesia_font_maison_neue_book_16, C_WHITE);
     lv_obj_set_align(s_status_time_label, LV_ALIGN_LEFT_MID);
-    lv_obj_set_x(s_status_time_label, -1);
+    lv_obj_set_x(s_status_time_label, 0);
 
     lv_obj_t *status_right = lv_obj_create(status_top);
     lv_obj_remove_style_all(status_right);
@@ -1223,13 +1223,26 @@ static void _update_system_status(void)
         lv_obj_clear_state(s_status_wifi_btn, LV_STATE_CHECKED);
     }
     /* 电量：真实 ADC 采样。状态栏 1s 刷新，但电池电压变化以分钟计，
-     * 这里 10s 才真正采一次，其余刷新复用缓存值，省电且避免 ADC 抖动。 */
+     * 这里 10s 才真正采一次，其余刷新复用缓存值，省电且避免 ADC 抖动。
+     * 充电状态单独 2s 检查一次（比电量更频繁），确保拔线后快速切图标。 */
     static int s_bat_pct_cached = 0;
     static bool s_bat_charging_cached = false;
     static uint8_t s_bat_tick = 0;
+    static uint8_t s_chg_tick = 0;
+
+    /* 充电状态：每 2s 检查一次 */
+    if (++s_chg_tick >= 2) {
+        s_chg_tick = 0;
+        s_bat_charging_cached = bat_monitor_is_charging();
+    }
+
+    /* 电量百分比：每 10s 采一次 */
     if (s_bat_tick == 0) {
         int raw_pct = bat_monitor_get_percent();
-        s_bat_charging_cached = bat_monitor_is_charging();
+
+        /* 诊断日志：用于校准分压比与满电电压（观察 10s 一次） */
+        ESP_LOGI(TAG, "BAT volts=%.3fV raw_pct=%d charging=%d",
+                 bat_monitor_get_volts(), raw_pct, (int)s_bat_charging_cached);
 
         /* 变化率限速：真实电池不可能在 10s 内跳几十个百分点。
          * 插拔充电器时端电压会阶跃，直接采信会导致百分比瞬跳，
@@ -1244,8 +1257,11 @@ static void _update_system_status(void)
     }
     if (++s_bat_tick >= 10) s_bat_tick = 0;
 
+    /* 100% 时不显示充电图标（电压阈值与百分比更新频率不同步时的兜底） */
+    bool show_charging = s_bat_charging_cached && s_bat_pct_cached < 100;
+
     const lv_img_dsc_t *bat_icon;
-    if (s_bat_charging_cached) {
+    if (show_charging) {
         bat_icon = &speaker_image_middle_quick_settings_battery_charge_20_20;
     } else if (s_bat_pct_cached >= 75) {
         bat_icon = &speaker_image_middle_quick_settings_battery_level4_20_20;

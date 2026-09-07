@@ -55,6 +55,12 @@ esp_err_t audio_out_write(const void *data, size_t size,
                           size_t *bytes_written, uint32_t timeout_ms);
 bool audio_out_is_paused(void);
 
+/** 当前 I2S 输出采样率 (Hz)；未初始化返回 0。提示音需按此率合成。 */
+int audio_out_get_rate(void);
+
+/** 当前 I2S 输出通道数；未初始化返回 0。 */
+int audio_out_get_ch(void);
+
 #ifdef __cplusplus
 }
 #endif

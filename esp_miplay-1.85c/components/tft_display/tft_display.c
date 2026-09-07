@@ -13,6 +13,7 @@
 #include "driver/ledc.h"
 #include "driver/spi_master.h"
 #include "esp_check.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -143,7 +144,7 @@ static const uint8_t font5x8[][5] = {
 
 /* ── 公共 API ── */
 
-static void tft_display_te_isr_handler(void *arg)
+static void IRAM_ATTR tft_display_te_isr_handler(void *arg)
 {
     (void)arg;
     if (s_lcd_te_semaphore != NULL) {

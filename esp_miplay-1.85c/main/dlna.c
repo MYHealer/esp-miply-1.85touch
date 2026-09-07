@@ -52,6 +52,7 @@
 #include "mdns.h"
 #include "esp_sntp.h"
 #include "bat_monitor.h"
+#include "chime.h"
 #define lodepng_malloc(s)    heap_caps_malloc(s, MALLOC_CAP_SPIRAM)
 #define lodepng_realloc(p,s) heap_caps_realloc(p, s, MALLOC_CAP_SPIRAM)
 #define lodepng_calloc(n,s)  heap_caps_calloc(n, s, MALLOC_CAP_SPIRAM)
@@ -261,6 +262,7 @@ typedef struct { int generation; } finish_arg_t;
 static void delayed_stop_notify(void *arg);
 static void schedule_delayed_stop_notify(void);
 void sntp_time_start(void);
+static void start_charge_monitor(void);
 static void cb_play(void);
 static void cb_next(void);
 static void cb_previous(void);
@@ -2615,6 +2617,56 @@ static void dlna_on_miplay_connected(bool connected)
 }
 
 /* ─────────────────────── Entry point ─────────────────────── */
+/* ─────────────── 充电检测 → 提示音 + 屏保 ───────────────
+ * 板子没有可用的充电 GPIO（TCA9555 的 CHRG_N 驱动未编译进工程），
+ * 因此沿用电压判断。检测到"未充电 → 充电"的上升沿时播提示音。
+ * 屏保由 UI 侧根据自身空闲计时自行进入，这里只负责提示音。 */
+static bool dlna_audio_is_busy(void)
+{
+    /* 正在播放音乐时不播提示音，避免与 GMF 管线抢 I2S 爆音 */
+    play_state_t st = get_state();
+    return (st == PS_PLAYING || st == PS_TRANSITIONING);
+}
+
+static void charge_monitor_task(void *arg)
+{
+    bool prev_charging = false;
+    bool first = true;
+
+    while (1) {
+        bool charging = bat_monitor_is_charging();
+        if (first) {
+            prev_charging = charging;
+            first = false;
+        } else if (charging && !prev_charging) {
+            ESP_LOGI(TAG, "Charger connected → chime");
+            chime_play_charge();
+        }
+        prev_charging = charging;
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
+static void start_charge_monitor(void)
+{
+    /* 常驻任务，PSRAM 静态栈（记忆：内部 SRAM 碎片化，运行时别动态建 task） */
+    static StaticTask_t s_tcb;
+    static StackType_t *s_stack = NULL;
+    if (!s_stack) {
+        s_stack = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+    }
+    if (!s_stack) {
+        ESP_LOGE(TAG, "charge monitor stack alloc failed");
+        return;
+    }
+    memset(&s_tcb, 0, sizeof(s_tcb));
+    if (!xTaskCreateStaticPinnedToCore(charge_monitor_task, "charge_mon",
+                                       4096 / sizeof(StackType_t), NULL,
+                                       4, s_stack, &s_tcb, 0)) {
+        ESP_LOGE(TAG, "charge monitor task create failed");
+    }
+}
+
 void app_main(void)
 {
     esp_log_level_set("*", ESP_LOG_INFO);
@@ -2663,6 +2715,11 @@ void app_main(void)
     miplay_pipeline_init();
     miplay_set_media_start_cb(dlna_on_miplay_media_start);
     miplay_set_vol_changed_cb(on_miplay_vol_changed);
+
+    /* ── 提示音（I2S 已在 audio_player_init 中初始化）── */
+    chime_init();
+    chime_set_busy_check(dlna_audio_is_busy);
+    start_charge_monitor();
 
     /* ── DLNA 服务（SSDP + HTTP + SOAP）── */
     start_dlna();
