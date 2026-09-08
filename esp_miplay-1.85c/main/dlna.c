@@ -748,12 +748,20 @@ static void consume_miplay_media_events_locked(void)
         bool duration_changed = (event->changed & MIPLAY_MEDIA_CHANGED_DURATION) &&
                                 event->duration_ms > 0 && s_miplay_duration_ms > 0 &&
                                 clamp_miplay_ms(event->duration_ms) != s_miplay_duration_ms;
-        /* id/封面/时长变了才是切歌。车载蓝牙歌词会把歌词行塞进标题，只更新标题。 */
-        bool new_track = id_changed || audio_id_changed || cover_changed || duration_changed ||
-                         (title_changed && !s_miplay_title[0]);
+        /* id/封面/标题/时长变了才是切歌。
+         * 车载蓝牙会把歌词行塞进标题（s_miplay_title 为空时收到首条标题），
+         * 该场景由 (title_changed && !s_miplay_title[0]) 覆盖；
+         * 正常投歌时标题变化本身就是切歌信号（同专辑切歌手机不上报新 id，
+         * 只换 title/album/duration，实测 Cage↔Unti-L 互切全靠 title 判定）。 */
+        bool new_track = id_changed || audio_id_changed || cover_changed ||
+                         duration_changed || title_changed;
         bool lyric_as_title = title_changed && s_miplay_title[0] && !new_track;
         if (lyric_as_title)
             ESP_LOGI(TAG, "MiPlay lyric-as-title: %.48s", event->title);
+        if (new_track)
+            ESP_LOGI(TAG, "MiPlay new_track: id=%d audio_id=%d cover=%d dur=%d title=%d (%.24s)",
+                     (int)id_changed, (int)audio_id_changed, (int)cover_changed,
+                     (int)duration_changed, (int)title_changed, event->title);
 
         if (new_track) {
             /* 只有身份真正变化才清理旧歌；空字段不能把新收到的元数据抹掉。 */
@@ -1311,14 +1319,38 @@ static void cb_seek(int seconds)
     }
 }
 
+/* 音量回控待发送值：本地调音量时记录，由 ui_update_task 在锁外发给手机。
+ * 不能在 SOAP 回调里直接发——receiver_control 要抢 session/send 两把锁，
+ * 在回调上下文发可能长时间阻塞（与 MiPlay 反控命令走异步 worker 同理）。 */
+static volatile int s_miplay_pending_volume = -1;
+
 static void cb_set_volume(int v)
 {
     ESP_LOGI(TAG, "SetVolume: %d (was %d, mute=%d, alc_el=%p)", v, s_vol, s_mute, s_alc_el);
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
     s_vol = v;
     if (s_mute) {
         s_mute = 0;
     }
     _my_vol_set(NULL, s_mute ? 0 : s_vol);
+    /* MiPlay 管线有独立 ALC，也要同步 */
+    if (s_miplay_alc_el) {
+        int alc_gain;
+        if (v <= 0) {
+            alc_gain = -64;
+        } else {
+            int diff = 100 - v;
+            alc_gain = -(diff * diff * 30) / 10000;
+            if (alc_gain < -64) alc_gain = -64;
+        }
+        esp_gmf_alc_set_gain_all(s_miplay_alc_el, (int8_t)alc_gain);
+    }
+    if (s_miplay_connected) {
+        /* MiPlay 投屏时本地音量要同步给手机，否则手机端显示的还是旧值 */
+        miplay_set_volume((uint32_t)v);
+        s_miplay_pending_volume = v;
+    }
 }
 
 static void cb_set_mute(int m)
@@ -2488,9 +2520,11 @@ static void ui_update_task(void *arg)
     while (1) {
         play_state_t ui_state = s_miplay_connected ? (play_state_t)s_miplay_state : get_state();
         /* 空闲态降频到 2Hz，播放态保持 25Hz。
-         * 用 TaskNotify 等待：按钮按下时立刻唤醒刷新，不必等满 40ms。 */
+         * 用 TaskNotify 等待：按钮按下时立刻唤醒刷新，不必等满 40ms。
+         * 有待发送的音量回控时也保持 40ms，确保尽快发出。 */
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(
-            (ui_state == PS_PLAYING || ui_state == PS_PAUSED) ? 40 : 500));
+            (ui_state == PS_PLAYING || ui_state == PS_PAUSED ||
+             s_miplay_pending_volume >= 0) ? 40 : 500));
 
         lvgl_port_lock();
 
@@ -2519,6 +2553,23 @@ static void ui_update_task(void *arg)
                  display_state, miplay_active ? "miplay" : "dlna");
         lvgl_port_ui_set_progress(pos_sec, duration_sec);
         lvgl_port_ui_set_state(display_state);
+        /* MiPlay 音量双向同步：
+         * 有本地待发送值 → 保持 40ms 节奏让它在锁外尽快发出；
+         * 否则跟随手机端音量（手机调音量时同步回本地 UI 与硬件）。 */
+        int pending_volume = -1;
+        if (miplay_active) {
+            pending_volume = s_miplay_pending_volume;
+            s_miplay_pending_volume = -1;
+            if (pending_volume < 0) {
+                int miplay_vol = (int)miplay_get_volume();
+                if (miplay_vol < 0) miplay_vol = 0;
+                if (miplay_vol > 100) miplay_vol = 100;
+                if (s_vol != miplay_vol) {
+                    s_vol = miplay_vol;
+                    if (s_mute && s_vol > 0) s_mute = 0;
+                }
+            }
+        }
         /* 音量变化检测：滑动时 SOAP 排队，这里 40ms 检测一次，只应用最新值 */
         if (s_vol != s_last_applied_vol) {
             int hw = s_mute ? 0 : s_vol;
@@ -2528,8 +2579,15 @@ static void ui_update_task(void *arg)
         lvgl_port_ui_set_volume(s_vol);
 
         /* 歌词界面可见时才更新（不可见时跳过，避免 label 在未加载屏幕上取错宽度） */
+        static bool s_last_lyrics_visible = false;
+        bool is_lyrics_vis = lvgl_port_ui_lyrics_is_visible();
+        if (is_lyrics_vis && !s_last_lyrics_visible) {
+            last_cur_line = -1;  /* 刚进入歌词界面立即强制刷新当前行 */
+        }
+        s_last_lyrics_visible = is_lyrics_vis;
+
         const lyric_data_t *lyr = lyrics_get_data();
-        if (lyr && lyr->loaded && lyr->count > 0 && lvgl_port_ui_lyrics_is_visible()) {
+        if (lyr && lyr->loaded && lyr->count > 0 && is_lyrics_vis) {
             int cur = lyrics_get_current_line(pos_ms);
             if (cur < 0 || cur >= lyr->count) {
                 /* 歌曲开头还没到第一条时间戳时，不能访问 lines[-1]。 */
@@ -2574,8 +2632,8 @@ static void ui_update_task(void *arg)
                         }
                         if (line_end <= line_start) line_end = line_start + 5000;
                         int line_dur = line_end - line_start;
-                        int est_sing = line_dur * 80 / 100;
-                        if (est_sing < 800) est_sing = 800;
+                        int est_sing = line_dur * 85 / 100;
+                        if (est_sing < 600) est_sing = 600;
                         int progress = (pos_ms - line_start) * 100 / est_sing;
                         if (progress < 0) progress = 0;
                         if (progress > 100) progress = 100;
@@ -2629,6 +2687,11 @@ static void ui_update_task(void *arg)
         lvgl_port_ui_lyrics_tick_scroll();
 
         lvgl_port_unlock();
+
+        /* 音量回控必须在 LVGL 锁外发送：receiver_control 要抢 session/send 两把锁，持 LVGL 锁等待会卡死画面刷新 */
+        if (pending_volume >= 0) {
+            miplay_send_receiver_control("volume", pending_volume);
+        }
 
         if ((++tick % 125) == 0) ESP_LOGI(TAG, "UI tick alive");
     }
@@ -2771,6 +2834,9 @@ static void dlna_on_miplay_connected(bool connected)
     custom_dlna_set_ssdp_suppressed(connected);
     if (connected) {
         ESP_LOGI(TAG, "=== MiPlay connected → stopping DLNA pipeline, arming MiPlay GMF ===");
+        /* 连接建立时把本地音量推给手机侧，并丢弃遗留的回控请求 */
+        miplay_set_volume((uint32_t)(s_mute ? 0 : s_vol));
+        s_miplay_pending_volume = -1;
         /* 清除 DLNA 元数据，防止旧歌信息残留在 UI */
         s_cur_title[0] = '\0';
         s_cur_artist[0] = '\0';
@@ -2928,6 +2994,7 @@ void app_main(void)
     lvgl_port_ui_register_btn_prev_cb(cb_previous);
     lvgl_port_ui_register_btn_play_cb(cb_play_toggle);
     lvgl_port_ui_register_btn_next_cb(cb_next);
+    lvgl_port_ui_register_volume_cb(cb_set_volume);
 
     lyrics_init();
     s_miplay_media_queue = xQueueCreateStatic(

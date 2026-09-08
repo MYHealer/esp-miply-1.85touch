@@ -98,9 +98,20 @@ bool miplay_is_connected(void);
 uint32_t miplay_get_volume(void);
 
 /**
+ * @brief 设置本地 MiPlay 音量百分比 (0-100)
+ *
+ * 立即作用于 s_volume_percent 并写入 NVS，后续 GET_VOLUME 会读到新值。
+ * 不会向手机发通知；回控请用 miplay_send_receiver_control("volume", percent)。
+ */
+void miplay_set_volume(uint32_t percent);
+
+/**
  * @brief 向手机发送反向控制通知
- * @param action "pause", "play", "next", "prev", "seek"
- * @param value  seek 时为 positionMs，其他为 0
+ * @param action "pause", "play", "next", "prev", "seek", "volume"
+ * @param value  seek 时为 positionMs，volume 时为 0-100，其他为 0
+ *
+ * 无活动媒体会话时 volume 会静默丢弃（未投屏调音量属正常场景），
+ * 其他动作仍打警告日志。
  */
 void miplay_send_receiver_control(const char *action, int64_t value);
 

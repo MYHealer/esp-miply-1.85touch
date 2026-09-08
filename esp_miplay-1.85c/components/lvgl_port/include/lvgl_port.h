@@ -90,6 +90,15 @@ void lvgl_port_ui_register_btn_next_cb(lvgl_btn_cb_t cb);
  */
 uint32_t lvgl_port_ui_track_seq(void);
 
+/* ══════════════════════════════════════════════
+ *  胶囊弹窗（音量/亮度）
+ * ══════════════════════════════════════════════ */
+int  lvgl_port_ui_get_volume(void);
+int  lvgl_port_ui_get_brightness(void);
+void lvgl_port_ui_set_brightness(int brightness);
+void lvgl_port_ui_register_volume_cb(void (*cb)(int));
+void lvgl_port_ui_register_brightness_cb(void (*cb)(int));
+
 #ifdef __cplusplus
 }
 #endif

@@ -5138,6 +5138,17 @@ uint32_t miplay_get_volume(void)
     return s_volume_percent;
 }
 
+/* ── 本地设置 MiPlay 音量百分比（0-100）──
+ * 立即作用于 s_volume_percent 与 NVS 持久化，后续 GET_VOLUME/GET_PARAMETER
+ * 会读到新值。不主动向手机发通知——回控请用
+ * miplay_send_receiver_control("volume", percent)。 */
+void miplay_set_volume(uint32_t percent)
+{
+    if (percent > 100) percent = 100;
+    s_volume_percent = percent;
+    miplay_save_volume(percent);
+}
+
 void miplay_send_receiver_control(const char *action, int64_t value)
 {
     if (!action) return;
@@ -5159,7 +5170,10 @@ void miplay_send_receiver_control(const char *action, int64_t value)
     if (!can_send) {
         if (s_send_mux) xSemaphoreGive(s_send_mux);
         if (s_session_mux) xSemaphoreGive(s_session_mux);
-        ESP_LOGW(TAG, "receiver-control dropped: no active media session (%s)", action);
+        /* 音量回控在无媒体会话时是常见场景（未投屏时调音量），不打警告刷屏 */
+        if (strcmp(action, "volume") != 0) {
+            ESP_LOGW(TAG, "receiver-control dropped: no active media session (%s)", action);
+        }
         return;
     }
 
@@ -5186,6 +5200,21 @@ void miplay_send_receiver_control(const char *action, int64_t value)
         uint64_t seek_value = value < 0 ? 0 : (uint64_t)value;
         for (int i = 7; i >= 0; i--)
             body[o++] = (uint8_t)((seek_value >> (i * 8)) & 0xFF);
+    } else if (strcmp(action, "volume") == 0) {
+        /* volume 回控（FusionPlay type-7）：键名无 "key-" 前缀，
+         * 结构是 [key_len=6]["volume"][type=0x07][u32 BE percent]。
+         * 与 SetVolume(0x000C) 之后的 sender-volume notify 字节格式一致。 */
+        uint32_t percent = value < 0 ? 0 : (uint32_t)value;
+        if (percent > 100) percent = 100;
+        s_volume_percent = percent;
+        miplay_save_volume(percent);
+        body[o++] = 6;
+        memcpy(body + o, "volume", 6); o += 6;
+        body[o++] = 0x07;
+        body[o++] = (uint8_t)((percent >> 24) & 0xFF);
+        body[o++] = (uint8_t)((percent >> 16) & 0xFF);
+        body[o++] = (uint8_t)((percent >> 8) & 0xFF);
+        body[o++] = (uint8_t)(percent & 0xFF);
     } else {
         /* key-prev / key-next */
         if (strcmp(action, "next") != 0 && strcmp(action, "prev") != 0) {

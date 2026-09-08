@@ -3,6 +3,7 @@ idf_component_register(SRCS "lvgl_port_disp.c" "lvgl_port_touch.c" "lvgl_port_ui
                     "ui_ref/ui_img_shangyi1_png.c" "ui_ref/ui_img_xiyi1_png.c" "ui_ref/ui_img_jiaopian_png.c" "ui_ref/ui_img_bg_gradient.c" "ui_ref/ui_img_citou_png.c"
                     "ui_ref/lv_font_simsun_16_cjk.c"
                     "ui_ref/lv_font_simsun_16_supplement.c"
+                    "ui_ref/lv_font_simsun_16_ipa.c"
                     "ui_brookesia/esp_brookesia_font_maison_neue_book_12.c"
                     "ui_brookesia/esp_brookesia_font_maison_neue_book_16.c"
                     "ui_brookesia/esp_brookesia_font_maison_neue_book_20.c"
@@ -21,6 +22,8 @@ idf_component_register(SRCS "lvgl_port_disp.c" "lvgl_port_touch.c" "lvgl_port_ui
                     "ui_brookesia/speaker_image_middle_quick_settings_battery_charge_20_20.c"
                     "ui_brookesia/speaker_image_middle_quick_settings_volume_high_48_48.c"
                     "ui_brookesia/speaker_image_middle_quick_settings_brightness_high_48_48.c"
+                    "ui_brookesia/capsule_vol_32_32.c"
+                    "ui_brookesia/capsule_bri_32_32.c"
                     "ui_brookesia/esp_brookesia_app_icon_arrow_left_48_48.c"
                     "ui_brookesia/esp_brookesia_app_icon_arrow_right_48_48.c"
                     "ui_brookesia/esp_brookesia_app_icon_wireless_wlan_48_48.c"
@@ -35,4 +38,4 @@ idf_component_register(SRCS "lvgl_port_disp.c" "lvgl_port_touch.c" "lvgl_port_ui
                     "ui_brookesia/esp_brookesia_app_icon_wlan_level3_36_36.c"
                     "ui_brookesia/esp_brookesia_app_icon_wlan_lock_48_48.c"
                     INCLUDE_DIRS "include" "../lvgl" "ui_ref"
-                    PRIV_REQUIRES tft_display lvgl echopal_board esp_driver_i2c esp_driver_gpio wifi_provision bat_monitor)
+                    PRIV_REQUIRES tft_display lvgl echopal_board esp_driver_i2c esp_driver_gpio wifi_provision bat_monitor nvs_flash)

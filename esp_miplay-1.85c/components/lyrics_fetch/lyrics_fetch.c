@@ -82,7 +82,7 @@ static BaseType_t lyrics_create_task(TaskFunction_t task, const char *name,
 static void parse_klyric(const char *klyric_text);
 
 /* ── HTTP 响应缓冲 ── */
-#define HTTP_SEARCH_BUF          2048
+#define HTTP_SEARCH_BUF          8192   /* limit=8 多候选搜索响应可达 4KB+ */
 #define HTTP_FALLBACK_SEARCH_BUF  16384
 #define HTTP_LYRIC_BUF           32768
 
@@ -252,127 +252,214 @@ static unsigned long json_get_int(const char *json, jsmntok_t *tok)
     return strtoul(tmp, NULL, 10);
 }
 
-/* ── 搜索歌曲，返回 songId，失败返回 0 ── */
-static unsigned long search_song(const char *title, const char *artist)
+/* ── 标题清洗：去掉 TV动画/OST/片尾曲等括号后缀，提升搜索命中率 ──
+ * "雲雀 (TV动画《...》片尾曲)" → "雲雀"；全角（）/《》/【】同样处理。
+ * 就地截断：遇到第一个 '(' / '（' 即停。 */
+static void strip_title_suffix(const char *in, char *out, int out_size)
 {
-    char keyword[128];
-    snprintf(keyword, sizeof(keyword), "%s %s", title, artist);
+    int o = 0;
+    for (int i = 0; in[i] && o < out_size - 1; i++) {
+        if (in[i] == '(' || in[i] == '（') break;
+        /* 前导/尾随空格不拷贝由调用方 trim，这里只截断 */
+        out[o++] = in[i];
+    }
+    /* 去尾随空格 */
+    while (o > 0 && out[o - 1] == ' ') o--;
+    out[o] = '\0';
+}
 
-    char encoded[256];
-    url_encode(keyword, encoded, sizeof(encoded));
+/* ── ASCII 小写化（多候选打分用，非 ASCII 字符原样保留）── */
+static void ascii_lower(const char *in, char *out, int out_size)
+{
+    int o = 0;
+    for (int i = 0; in[i] && o < out_size - 1; i++) {
+        unsigned char c = (unsigned char)in[i];
+        out[o++] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : (char)c;
+    }
+    out[o] = '\0';
+}
 
-    char post_data[320];
-    snprintf(post_data, sizeof(post_data),
-             "s=%s&type=1&limit=1&offset=0", encoded);
+/* ── jsmn 容器宽度：返回容器 token（OBJ/ARR）结束后的下一个下标 ──
+ * jsmn 的 size = 直接子 token 数（object: key+value 各算一个）。
+ * 递归定义：宽度 = 1 + Σ(每个直接子 token 的宽度)；标量宽度 = 1。 */
+static int jsmn_container_end(const jsmntok_t *tokens, int num, int idx)
+{
+    if (idx < 0 || idx >= num) return idx;
+    jsmntype_t t = tokens[idx].type;
+    if (t != JSMN_OBJECT && t != JSMN_ARRAY) return idx + 1;
 
-    char *resp = http_request("http://music.163.com/api/search/get",
-                              post_data, "application/x-www-form-urlencoded",
-                              HTTP_SEARCH_BUF);
-    if (!resp) {
-        ESP_LOGW(TAG, "search_song: HTTP request failed");
+    int width = 1;             /* 容器自身占 1 */
+    for (int i = 0; i < tokens[idx].size; i++) {
+        if (idx + width >= num) break;
+        jsmntype_t ct = tokens[idx + width].type;
+        if (ct == JSMN_OBJECT || ct == JSMN_ARRAY) {
+            int sub_end = jsmn_container_end(tokens, num, idx + width);
+            width += sub_end - (idx + width);
+        } else {
+            width += 1;
+        }
+    }
+    return idx + width;
+}
+
+/* ── 解析 NetEase 搜索响应，多候选打分选最佳 songId ──
+ * 响应结构: {result:{songs:[{id,name,...},...]}}
+ * 打分: 100=歌名完全相等(忽略大小写), 60+长度比=前缀匹配, 40=包含, 0=兜底
+ */
+static unsigned long search_parse_best(const char *resp, const char *clean_title)
+{
+    /* limit=8 的搜索响应实测需要 ~700 token，512 会 JSMN_ERROR_NOMEM(-1)。
+     * jsmntok_t 约 16 字节，1024 个 = 16KB，放在此任务自己的 PSRAM 栈上没问题
+     * （lyric_fetch 任务栈 48KB PSRAM）。 */
+    jsmn_parser parser;
+    jsmntok_t *tokens = malloc(sizeof(jsmntok_t) * 1024);
+    if (!tokens) {
+        ESP_LOGE(TAG, "token array alloc failed");
         return 0;
     }
-    ESP_LOGI(TAG, "search resp (%d bytes)", (int)strlen(resp));
-
-    /* 解析 JSON */
-    jsmn_parser parser;
-    jsmntok_t tokens[512];
     jsmn_init(&parser);
-    int num = jsmn_parse(&parser, resp, strlen(resp), tokens, 512);
+    int num = jsmn_parse(&parser, resp, strlen(resp), tokens, 1024);
     if (num < 0) {
         ESP_LOGE(TAG, "JSON parse error: %d", num);
-        free(resp);
+        free(tokens);
         return 0;
     }
 
     /* result.songs[] */
     int ri = json_find_key(resp, tokens, num, 0, "result");
-    if (ri < 0) { free(resp); return 0; }
+    if (ri < 0) { free(tokens); return 0; }
     int si = json_find_key(resp, tokens, num, ri, "songs");
-    if (si < 0) { free(resp); return 0; }
+    if (si < 0) { free(tokens); return 0; }
     if (tokens[si].type != JSMN_ARRAY || tokens[si].size < 1) {
-        free(resp); return 0;
+        free(tokens);
+        return 0;
     }
 
-    /*
-     * 遍历 songs 数组，对每个元素找顶层 "id" 和 "name"
-     * 关键：跳过嵌套 object/array，避免匹配到 artist.id 等内部字段
-     */
+    /* 遍历 songs 数组，对每个元素找顶层 "id" 和 "name"
+     * jsmn size 语义：容器的 size = 直接子 token 数（object 是 key+value 各算一个）。
+     * 容器跳转必须用 jsmn_container_end 递归算宽度，累加 size 的旧算法对
+     * cloudsearch 这类深嵌套响应会算错 obj_end → 解析出 id=0。 */
     int song_count = tokens[si].size;
     int pos = si + 1;  /* songs 数组第一个元素 */
     unsigned long best_id = 0;
     char best_name[64] = "";
+    int best_score = -1;
 
     for (int s = 0; s < song_count && pos < num; s++) {
         if (tokens[pos].type != JSMN_OBJECT) { pos++; continue; }
-        int obj_end = pos;
-        /* 计算这个 object 的结束位置 */
-        {
-            int depth = 1;
-            int j = pos + 1;
-            while (j < num && depth > 0) {
-                if (tokens[j].type == JSMN_OBJECT || tokens[j].type == JSMN_ARRAY) depth += tokens[j].size;
-                j++;
-                depth--;
-            }
-            obj_end = j;  /* object 结束后的下一个位置 */
-        }
+        int obj_end = jsmn_container_end(tokens, num, pos);
 
         /* 在这个 object 内找顶层 "id" 和 "name"（只看直接子 key） */
         unsigned long song_id = 0;
         char song_name[64] = "";
         int scan = pos + 1;
         while (scan < obj_end && scan < num) {
+            int klen = tokens[scan].end - tokens[scan].start;
             if (tokens[scan].type == JSMN_STRING) {
-                int klen = tokens[scan].end - tokens[scan].start;
-                /* 顶层 "id" key */
+                /* 顶层 "id" key（值必须是 PRIMITIVE 数字，杜绝嵌套对象里的字符串 id） */
                 if (klen == 2 && memcmp(resp + tokens[scan].start, "id", 2) == 0
-                    && scan + 1 < num) {
+                    && scan + 1 < num && tokens[scan + 1].type == JSMN_PRIMITIVE) {
                     song_id = json_get_int(resp, &tokens[scan + 1]);
                 }
-                /* 顶层 "name" key */
-                if (klen == 4 && memcmp(resp + tokens[scan].start, "name", 4) == 0
-                    && scan + 1 < num && tokens[scan + 1].type == JSMN_PRIMITIVE) {
-                    /* 跳过（可能是嵌套 object 的 name） */
-                }
+                /* 顶层 "name" key（值必须是 STRING） */
                 if (klen == 4 && memcmp(resp + tokens[scan].start, "name", 4) == 0
                     && scan + 1 < num && tokens[scan + 1].type == JSMN_STRING) {
                     json_get_string(resp, &tokens[scan + 1], song_name, sizeof(song_name));
                 }
-                /* 跳过 value */
-                scan += 2;
-                /* 如果 value 是 object/array，跳过子树 */
-                if (scan - 1 < num && (tokens[scan - 1].type == JSMN_OBJECT || tokens[scan - 1].type == JSMN_ARRAY)) {
-                    int skip_depth = tokens[scan - 1].size;
-                    while (scan < num && skip_depth > 0) {
-                        if (tokens[scan].type == JSMN_OBJECT || tokens[scan].type == JSMN_ARRAY)
-                            skip_depth += tokens[scan].size;
-                        scan++;
-                        skip_depth--;
-                    }
-                }
-            } else {
-                scan++;
+            }
+            /* 跳过 key + value 对；value 是容器时按其真实宽度跳 */
+            scan += 2;
+            if (scan - 1 < num && (tokens[scan - 1].type == JSMN_OBJECT || tokens[scan - 1].type == JSMN_ARRAY)) {
+                scan = jsmn_container_end(tokens, num, scan - 1);
             }
         }
 
+
         ESP_LOGI(TAG, "song[%d]: id=%d name='%s'", s, song_id, song_name);
-        if (song_id > 0 && best_id == 0) {
-            best_id = song_id;
-            snprintf(best_name, sizeof(best_name), "%s", song_name);
+        if (song_id > 0) {
+            /* 打分：候选歌名与清洗后目标歌名的匹配度 */
+            int score = 0;
+            char cand[64], target[64];
+            ascii_lower(song_name, cand, sizeof(cand));
+            ascii_lower(clean_title, target, sizeof(target));
+            if (cand[0] && target[0]) {
+                if (strcmp(cand, target) == 0) {
+                    score = 100;
+                } else {
+                    /* 候选含目标前缀（如 "Cage (WALL-G Edit)" 含 "cage"） */
+                    size_t tl = strlen(target);
+                    if (strncmp(cand, target, tl) == 0) {
+                        score = 60 + (int)(tl * 40 / strlen(cand));
+                    } else if (strstr(cand, target)) {
+                        score = 40;
+                    }
+                }
+            }
+            if (best_id == 0 || score > best_score) {
+                best_id = song_id;
+                snprintf(best_name, sizeof(best_name), "%s", song_name);
+                best_score = score;
+            }
         }
 
         pos = obj_end;
     }
 
     if (best_id > 0) {
-        ESP_LOGI(TAG, "Found: [%d] %s", best_id, best_name);
+        ESP_LOGI(TAG, "Found: [%d] %s (score=%d)", best_id, best_name, best_score);
     } else {
-        ESP_LOGW(TAG, "Song not found");
+        ESP_LOGW(TAG, "Song not found in this endpoint");
+    }
+    free(tokens);
+    return best_id;
+}
+
+/* ── 搜索歌曲（NetEase 两级），返回 songId，失败返回 0 ── */
+static unsigned long search_song(const char *title, const char *artist)
+{
+    char clean_title[128];
+    strip_title_suffix(title, clean_title, sizeof(clean_title));
+    if (!clean_title[0]) {
+        snprintf(clean_title, sizeof(clean_title), "%s", title ? title : "");
     }
 
+    char keyword[128];
+    snprintf(keyword, sizeof(keyword), "%s %s", clean_title, artist);
+
+    char encoded[256];
+    url_encode(keyword, encoded, sizeof(encoded));
+
+    char post_data[320];
+    /* 请求参数 limit=8：给多候选打分留足余量 */
+    snprintf(post_data, sizeof(post_data),
+             "s=%s&type=1&limit=8&offset=0", encoded);
+
+    /* 第一级：老接口 */
+    char *resp = http_request("http://music.163.com/api/search/get",
+                              post_data, "application/x-www-form-urlencoded",
+                              HTTP_SEARCH_BUF);
+    if (resp) {
+        ESP_LOGI(TAG, "search resp (%d bytes)", (int)strlen(resp));
+        unsigned long id = search_parse_best(resp, clean_title);
+        free(resp);
+        if (id > 0) return id;
+    } else {
+        ESP_LOGW(TAG, "search_song: HTTP request failed");
+    }
+
+    /* 第二级：cloudsearch 新接口兜底（老接口空结果/HTTP失败时） */
+    ESP_LOGI(TAG, "NetEase primary search miss, trying cloudsearch");
+    resp = http_request_ex("https://music.163.com/api/cloudsearch/pc",
+                           post_data, "application/x-www-form-urlencoded",
+                           HTTP_SEARCH_BUF, "https://music.163.com");
+    if (!resp) {
+        ESP_LOGW(TAG, "cloudsearch HTTP failed");
+        return 0;
+    }
+    ESP_LOGI(TAG, "cloudsearch resp (%d bytes)", (int)strlen(resp));
+    unsigned long id = search_parse_best(resp, clean_title);
     free(resp);
-    return best_id;
+    return id;
 }
 
 /* ── JSON 转义还原（\n → 换行等）── */
@@ -851,10 +938,15 @@ static char *normalize_lyric_payload(char *lyric)
 
 static char *fetch_lrc_qq(const char *title, const char *artist)
 {
+    char clean_title[128];
+    strip_title_suffix(title, clean_title, sizeof(clean_title));
+    if (!clean_title[0]) {
+        snprintf(clean_title, sizeof(clean_title), "%s", title ? title : "");
+    }
     char keyword[128];
     char encoded[256];
     char url[512];
-    snprintf(keyword, sizeof(keyword), "%s %s", title, artist);
+    snprintf(keyword, sizeof(keyword), "%s %s", clean_title, artist);
     url_encode(keyword, encoded, sizeof(encoded));
     snprintf(url, sizeof(url),
              "https://c.y.qq.com/soso/fcgi-bin/client_search_cp?format=json&n=1&p=1&w=%s",
@@ -862,7 +954,12 @@ static char *fetch_lrc_qq(const char *title, const char *artist)
 
     char *resp = http_request_ex(url, NULL, NULL, HTTP_FALLBACK_SEARCH_BUF, "https://y.qq.com");
     if (!resp) {
-        ESP_LOGW(TAG, "QQ search HTTP failed");
+        /* QQ 搜索偶发 HTTP 失败（连接被重置/DNS 抖动），重试一次 */
+        vTaskDelay(pdMS_TO_TICKS(300));
+        resp = http_request_ex(url, NULL, NULL, HTTP_FALLBACK_SEARCH_BUF, "https://y.qq.com");
+    }
+    if (!resp) {
+        ESP_LOGW(TAG, "QQ search HTTP failed (retry exhausted)");
         return NULL;
     }
 
@@ -972,10 +1069,15 @@ static char *kuwo_lrclist_to_lrc(const char *resp)
 
 static char *fetch_lrc_kuwo(const char *title, const char *artist)
 {
+    char clean_title[128];
+    strip_title_suffix(title, clean_title, sizeof(clean_title));
+    if (!clean_title[0]) {
+        snprintf(clean_title, sizeof(clean_title), "%s", title ? title : "");
+    }
     char keyword[128];
     char encoded[256];
     char url[512];
-    snprintf(keyword, sizeof(keyword), "%s %s", title, artist);
+    snprintf(keyword, sizeof(keyword), "%s %s", clean_title, artist);
     url_encode(keyword, encoded, sizeof(encoded));
     snprintf(url, sizeof(url),
              "http://search.kuwo.cn/r.s?all=%s&ft=music&itemset=web_2013&client=kt"
@@ -1105,7 +1207,13 @@ static void fetch_task(void *arg)
         }
 
         if (gen != s_fetch_gen) continue;
-        ESP_LOGI(TAG, "Searching NetEase lyrics: %s - %s", title, artist);
+        /* 打印清洗后的实际关键词，便于核对搜索行为 */
+        {
+            char log_title[96];
+            strip_title_suffix(title, log_title, sizeof(log_title));
+            ESP_LOGI(TAG, "Searching NetEase lyrics: %s - %s",
+                     log_title[0] ? log_title : "", artist);
+        }
         {
             unsigned long song_id = search_song(title, artist);
             if (gen != s_fetch_gen) continue;
