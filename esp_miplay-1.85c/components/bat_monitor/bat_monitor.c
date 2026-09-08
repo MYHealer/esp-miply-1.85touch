@@ -265,8 +265,8 @@ bool bat_monitor_is_charging(void)
     }
 
     /* 电压高于充电阈值：看趋势 */
-    if (mv >= s_peak_mv) {
-        /* 电压上升或持平 → 充电中 */
+    if (mv > s_peak_mv) {
+        /* 电压上升 → 充电中 */
         s_peak_mv = mv;
         s_drop_count = 0;
         if (!s_state) {
@@ -274,17 +274,26 @@ bool bat_monitor_is_charging(void)
             ESP_LOGI(TAG, "charging -> 1 (%dmV, rising)", mv);
         }
     } else {
-        /* 电压下降 */
-        s_drop_count++;
-        int drop = s_peak_mv - mv;
-        if (drop >= 4 && s_drop_count >= 2) {
-            /* 连续下降超过 4mV → 判定拔线 */
+        /* 电压持平或下降：持平时不进入充电，下降时累积退出 */
+        if (mv < s_peak_mv) {
+            /* 下降：累积判断拔线 */
+            s_drop_count++;
+            int drop = s_peak_mv - mv;
+            if (drop >= 4 && s_drop_count >= 2) {
+                if (s_state) {
+                    s_state = false;
+                    ESP_LOGI(TAG, "charging -> 0 (%dmV, drop %dmV from peak)", mv, drop);
+                }
+                s_peak_mv = mv;
+                s_drop_count = 0;
+            }
+        } else {
+            /* 持平：播放+USB供电但电流不够时常见，不判定充电 */
+            s_drop_count = 0;
             if (s_state) {
                 s_state = false;
-                ESP_LOGI(TAG, "charging -> 0 (%dmV, drop %dmV from peak)", mv, drop);
+                ESP_LOGI(TAG, "charging -> 0 (%dmV, flat)", mv);
             }
-            s_peak_mv = mv;
-            s_drop_count = 0;
         }
     }
 

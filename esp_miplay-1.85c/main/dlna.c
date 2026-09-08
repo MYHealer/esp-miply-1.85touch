@@ -57,6 +57,7 @@
 #define lodepng_realloc(p,s) heap_caps_realloc(p, s, MALLOC_CAP_SPIRAM)
 #define lodepng_calloc(n,s)  heap_caps_calloc(n, s, MALLOC_CAP_SPIRAM)
 #define lodepng_free(p)      heap_caps_free(p)
+#include "lvgl.h"
 #include "libs/lodepng/lodepng.h"
 
 static const char *TAG = "DLNA_APP";
@@ -107,6 +108,9 @@ static int           s_last_i2s_bits     = 16;
 static int           s_last_i2s_ch       = 2;
 /* 断点续播：记住暂停/停止时的播放位置 */
 static int           s_saved_pos_sec     = 0;
+static int           s_pending_seek_sec  = 0;  /* 延迟到 RUNNING 状态再 seek */
+static int           s_dur_cache_sec     = 0;  /* 最近一次有效时长（秒） */
+static void deferred_seek_worker(void *arg);   /* 定义在 s_dur_cache_sec 之后 */
 static char         *s_saved_uri         = NULL;
 static unsigned long s_music_id          = 0;   /* 当前歌曲 ID，用于检测音质切换 */
 /* 用于 GENA 去抖：相同状态不重复 notify */
@@ -297,6 +301,42 @@ static void schedule_delayed_stop_notify(void)
 }
 
 /* ─────────────────────── GMF pipeline 事件回调 ─────────────────────── */
+/* 延迟 seek worker（对齐 cb_seek 的成熟路径）：
+ * GMF 的 pipeline_seek 只接受 PAUSED/STOPPED/FINISHED，播放中（RUNNING/OPENING）
+ * 直接 seek 会被拒。所以照搬 cb_seek：先 pause → 按字节 seek → 再 resume。
+ * 字节偏移优先用 HTTP IO 的 file_info（真实文件大小），缺省按 16KB/s 估算。
+ * 注意：FreeRTOS 任务绝不能 return，结束时必须 vTaskDelete(NULL)。 */
+static void deferred_seek_worker(void *arg)
+{
+    int sec = *(int *)arg;
+    free(arg);
+
+    if (s_pipe && get_state() == PS_PLAYING) {
+        s_media_generation++;
+        esp_gmf_pipeline_pause(s_pipe);
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+        uint64_t byte_pos = 0;
+        esp_gmf_info_file_t file_info = {0};
+        esp_gmf_io_handle_t in_io = ESP_GMF_PIPELINE_GET_IN_INSTANCE(s_pipe);
+        if (in_io) {
+            esp_gmf_io_get_info(in_io, &file_info);
+        }
+        if (file_info.size > 0 && s_dur_cache_sec > 0) {
+            byte_pos = ((uint64_t)sec * file_info.size) / s_dur_cache_sec;
+        } else {
+            byte_pos = (uint64_t)sec * 16000;  /* 粗略估算 128kbps MP3 */
+        }
+
+        esp_gmf_err_t err = esp_gmf_pipeline_seek(s_pipe, byte_pos);
+        ESP_LOGI(TAG, "Deferred seek: %d s → byte %llu (err=%d)", sec, byte_pos, err);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        esp_gmf_pipeline_resume(s_pipe);
+        pos_store_i64(&s_play_start_us, esp_timer_get_time());
+    }
+    dlna_delete_current_task();
+}
+
 static esp_gmf_err_t pipeline_event_cb(esp_gmf_event_pkt_t *event, void *ctx)
 {
     (void)ctx;
@@ -311,6 +351,21 @@ static esp_gmf_err_t pipeline_event_cb(esp_gmf_event_pkt_t *event, void *ctx)
                 set_state(PS_PLAYING);
                 if (pos_load_i64(&s_play_start_us) == 0) {
                     pos_store_i64(&s_play_start_us, esp_timer_get_time());
+                }
+                /* 延迟 seek：GMF 的 pipeline_seek 只接受 PAUSED/STOPPED/FINISHED，
+                 * 管线刚 run 完处于 OPENING，立即 seek 会被拒（实测踩坑）。
+                 * 投递独立 worker 走 cb_seek 同款路径：pause → seek → resume。 */
+                if (s_pending_seek_sec > 0) {
+                    int sec = s_pending_seek_sec;
+                    s_pending_seek_sec = 0;
+                    int *sec_arg = malloc(sizeof(int));
+                    if (sec_arg) {
+                        *sec_arg = sec;
+                        if (dlna_create_task(deferred_seek_worker, "dlna_seek",
+                                             4096, sec_arg, 5, NULL, 0) != pdPASS) {
+                            free(sec_arg);
+                        }
+                    }
                 }
                 break;
             case ESP_GMF_EVENT_STATE_PAUSED:
@@ -414,8 +469,6 @@ static int cb_get_position_ms(void)
     }
     return s_accumulated_ms;
 }
-
-static int s_dur_cache_sec = 0;  /* 最近一次有效时长（秒） */
 
 /* ── 当前歌曲信息（从 DIDL-Lite metadata 解析）── */
 static EXT_RAM_BSS_ATTR char s_cur_title[128];
@@ -912,11 +965,13 @@ static void delayed_stop_notify(void *arg)
     dlna_delete_current_task();
 }
 
-static void _do_play(const char *uri, int seek_sec)
+static void _do_play(const char *uri_in, int seek_sec)
 {
     s_media_generation++;
     s_near_end_count = 0;
-    if (!s_pipe || !uri) return;
+    if (!s_pipe || !uri_in) return;
+
+    const char *uri = uri_in;
 
     /* 宽限期：从 _do_play 入口就生效，覆盖管线重置→HTTP连接→run 全过程
      * 防止手机 poll 在此窗口内读到 STOPPED 中间状态（对齐 miair-next） */
@@ -980,12 +1035,15 @@ static void _do_play(const char *uri, int seek_sec)
         pos_store_i64(&s_grace_until, esp_timer_get_time() + 8000000LL);
         s_user_stopped = 0;
         free(s_playing_uri);
-        s_playing_uri = strdup_psram(uri);
+        /* 用解码前的原始指针，避免 decoded_uri（栈上缓冲）失效。
+         * 口径与 s_track_uri 一致（都带 &amp;），cb_play 的 strcmp 才能正确
+         * 识别"同一首歌恢复暂停"，否则暂停恢复永远误判为切歌。 */
+        s_playing_uri = strdup_psram(uri_in);
         if (seek_sec > 0) {
-            vTaskDelay(pdMS_TO_TICKS(300));
-            /* GMF seek 按字节偏移，粗略估算（128kbps MP3 ≈ 16000 B/s） */
-            esp_gmf_pipeline_seek(s_pipe, (uint64_t)seek_sec * 16000);
-            ESP_LOGI(TAG, "Resumed from %d s (seek)", seek_sec);
+            /* 延迟 seek：pipeline_run 后仍处于 OPENING 状态，立即 seek 会被拒绝。
+             * 存到 s_pending_seek_sec，等 GMF_EVENT_STATE_RUNNING 回调再执行。 */
+            s_pending_seek_sec = seek_sec;
+            ESP_LOGI(TAG, "Seek deferred: %d s (waiting for RUNNING)", seek_sec);
         }
     } else {
         ESP_LOGE(TAG, "esp_gmf_pipeline_run failed: %d", err);
@@ -1079,6 +1137,7 @@ static void cb_pause(void)
     }
     play_state_t cur = get_state();
     ESP_LOGI(TAG, "Pause (state=%d)", cur);
+    s_pending_seek_sec = 0;  /* 暂停时取消延迟 seek */
     if (s_pipe && cur == PS_PLAYING) {
         /* 冻结累计播放时间 */
         if (pos_load_i64(&s_play_start_us) > 0) {
@@ -1930,16 +1989,31 @@ static void album_art_task(void *arg)
         ESP_LOGI(TAG, "JPEG decoded: %dx%d -> crop %d -> %dx%d", info.width, info.height, crop_sz, sw, sh);
 
     } else if (img_data[0] == 0x89 && img_data[1] == 0x50) {
-        /* ====== PNG 解码（lodepng） ====== */
+        /* ====== PNG 解码（lodepng） ======
+         * 必须用 decode32：网易云等源常返回 RGBA PNG（IHDR color type 6），
+         * 按 RGB(3B/px) 硬切 4B/px 的像素流会导致通道错位 → 彩虹纹。 */
         unsigned png_w = 0, png_h = 0;
         uint8_t *png_rgb = NULL;
-        /* 用 RGB（3 字节/像素）而非 RGBA，省 25% 内存 */
-        unsigned err = lodepng_decode24(&png_rgb, &png_w, &png_h, img_data, img_len);
+        unsigned err = lodepng_decode32(&png_rgb, &png_w, &png_h, img_data, img_len);
         if (err) {
             ESP_LOGW(TAG, "PNG decode failed: %u (%s), w=%u h=%u", err, lodepng_error_text(err), png_w, png_h);
             heap_caps_free(img_data);
             free(url);
             continue;
+        }
+        /* LVGL 魔改版 lodepng (CONFIG_LV_USE_LODEPNG) 返回的 *out 实际是
+         * lv_draw_buf_t*（PNGDBG 实证: 首字节 0x19=LV_IMAGE_HEADER_MAGIC）。
+         * 真正的像素在 ->data，按 header.stride 取行距。 */
+        lv_draw_buf_t *png_draw_buf = (lv_draw_buf_t *)png_rgb;
+        if (png_draw_buf->header.magic != LV_IMAGE_HEADER_MAGIC) {
+            /* 保险：非魔改版（标准 lodepng）则指针就是像素本身 */
+            ESP_LOGW(TAG, "PNG: plain lodepng buffer (no draw_buf header)");
+        } else {
+            png_rgb = png_draw_buf->data;
+            png_w = png_draw_buf->header.w;
+            png_h = png_draw_buf->header.h;
+            ESP_LOGI(TAG, "PNG: draw_buf w=%u h=%u stride=%u cf=%u",
+                     png_w, png_h, png_draw_buf->header.stride, png_draw_buf->header.cf);
         }
         /* 下载缓冲区已无用，立即释放 */
         heap_caps_free(img_data);
@@ -1956,11 +2030,18 @@ static void album_art_task(void *arg)
         out_buf = (uint16_t *)heap_caps_malloc(out_buf_size, MALLOC_CAP_SPIRAM);
         if (!out_buf) {
             ESP_LOGW(TAG, "PNG out_buf alloc failed (%zu)", out_buf_size);
-            free(png_rgb);
+            if (png_draw_buf->header.magic == LV_IMAGE_HEADER_MAGIC) {
+                lv_draw_buf_destroy(png_draw_buf);
+            } else {
+                free(png_rgb);
+            }
             free(url);
             continue;
         }
-        /* 双线性缩放 + RGB888 -> RGB565 */
+        /* 双线性缩放 + RGBA8888 -> RGB565（alpha 丢弃，封面图不透明）。
+         * 魔改版 lodepng 输出 cf=ARGB8888 但实测字节序为 R,G,B,A
+         *（实机验证: BGRA 读法颜色反, RGBA 读法正确），以实测为准。 */
+        bool is_draw_buf = (png_draw_buf->header.magic == LV_IMAGE_HEADER_MAGIC);
         for (int y = 0; y < sh; y++) {
             float fy = crop_y + (float)y / sh * crop_sz;
             for (int x = 0; x < sw; x++) {
@@ -1970,17 +2051,22 @@ static void album_art_task(void *arg)
                 if (iy >= png_h - 1) iy = png_h - 2;
                 float dx = fx - ix, dy = fy - iy;
                 int base = iy * png_w + ix;
-                int r = (int)((png_rgb[base*3]*(1-dx) + png_rgb[(base+1)*3]*dx)*(1-dy) +
-                              (png_rgb[(base+png_w)*3]*(1-dx) + png_rgb[(base+png_w+1)*3]*dx)*dy);
-                int g = (int)((png_rgb[base*3+1]*(1-dx) + png_rgb[(base+1)*3+1]*dx)*(1-dy) +
-                              (png_rgb[(base+png_w)*3+1]*(1-dx) + png_rgb[(base+png_w+1)*3+1]*dx)*dy);
-                int b = (int)((png_rgb[base*3+2]*(1-dx) + png_rgb[(base+1)*3+2]*dx)*(1-dy) +
-                              (png_rgb[(base+png_w)*3+2]*(1-dx) + png_rgb[(base+png_w+1)*3+2]*dx)*dy);
+                int r = (int)((png_rgb[base*4]*(1-dx) + png_rgb[(base+1)*4]*dx)*(1-dy) +
+                              (png_rgb[(base+png_w)*4]*(1-dx) + png_rgb[(base+png_w+1)*4]*dx)*dy);
+                int g = (int)((png_rgb[base*4+1]*(1-dx) + png_rgb[(base+1)*4+1]*dx)*(1-dy) +
+                              (png_rgb[(base+png_w)*4+1]*(1-dx) + png_rgb[(base+png_w+1)*4+1]*dx)*dy);
+                int b = (int)((png_rgb[base*4+2]*(1-dx) + png_rgb[(base+1)*4+2]*dx)*(1-dy) +
+                              (png_rgb[(base+png_w)*4+2]*(1-dx) + png_rgb[(base+png_w+1)*4+2]*dx)*dy);
                 out_buf[y * sw + x] = ((r >> 3) << 11) |
                                       ((g >> 2) << 5) | (b >> 3);
             }
         }
-        free(png_rgb);
+        /* 释放：draw_buf 用 lv_draw_buf_destroy，纯 lodepng 用 free */
+        if (is_draw_buf) {
+            lv_draw_buf_destroy(png_draw_buf);
+        } else {
+            free(png_rgb);
+        }
         out_w = sw; out_h = sh;
         ESP_LOGI(TAG, "PNG decoded: %ux%u -> %dx%d (crop=%d)", png_w, png_h, out_w, out_h, crop_sz);
 
