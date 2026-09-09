@@ -9,6 +9,7 @@
 #define LV_FONT_MONTSERRAT_12 1
 #define LV_FONT_MONTSERRAT_14 1
 #define LV_FONT_MONTSERRAT_16 1
+#define LV_FONT_MONTSERRAT_48 1
 #include "lvgl.h"
 #include "src/widgets/label/lv_label_private.h"
 #include "esp_log.h"
@@ -75,6 +76,7 @@ LV_IMG_DECLARE(ui_img_citou_png);
 LV_FONT_DECLARE(lv_font_simsun_16_cjk);
 LV_FONT_DECLARE(lv_font_simsun_16_supplement);
 LV_FONT_DECLARE(lv_font_simsun_16_ipa);
+LV_FONT_DECLARE(lv_font_montserrat_48);
 
 /* RAM 可写副本（原字体是 const 在 flash，不能直接写 fallback 字段）*/
 static lv_font_t s_cjk_font;
@@ -342,6 +344,8 @@ static lv_obj_t *s_status_sram_bar;
 static lv_obj_t *s_status_psram_bar;
 static lv_obj_t *s_wlan_scr;
 static lv_obj_t *s_softap_scr;
+static lv_obj_t *s_standby_scr;
+static lv_obj_t *s_standby_time_label;
 static lv_obj_t *s_wlan_connected_label;
 static lv_obj_t *s_wlan_available_label;
 static lv_obj_t *s_softap_qrcode;
@@ -408,6 +412,9 @@ static void _maybe_return_after_provision(void);
 static void _pause_playback_if_playing(void);
 static void _show_main_screen(void);
 static void _show_parent_screen(void);
+static void _show_standby_screen(void);
+static void _create_standby_screen(void);
+static void _update_standby_time(void);
 static void _update_system_status(void);
 static void _gesture_timer_cb(lv_timer_t *timer);
 static void _wifi_status_timer_cb(lv_timer_t *timer);
@@ -1991,9 +1998,85 @@ static void _show_main_screen(void)
     _show_return_bar(false);
 }
 
+static void _update_standby_time(void)
+{
+    if (!s_standby_time_label) return;
+    time_t now = time(NULL);
+    struct tm local_time = {0};
+    if (localtime_r(&now, &local_time) == NULL) {
+        memset(&local_time, 0, sizeof(local_time));
+    }
+    lv_label_set_text_fmt(s_standby_time_label, "%02d:%02d", local_time.tm_hour, local_time.tm_min);
+}
+
+static void _standby_scr_click_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "Standby screen touched, waking up to previous screen");
+    _show_parent_screen();
+}
+
+static void _create_standby_screen(void)
+{
+    if (s_standby_scr) return;
+
+    s_standby_scr = lv_obj_create(NULL);
+    lv_obj_clear_flag(s_standby_scr, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(s_standby_scr, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_style_bg_color(s_standby_scr, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_standby_scr, LV_OPA_COVER, 0);
+    lv_obj_add_flag(s_standby_scr, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_standby_scr, _standby_scr_click_cb, LV_EVENT_CLICKED, NULL);
+
+    s_standby_time_label = lv_label_create(s_standby_scr);
+    lv_obj_clear_flag(s_standby_time_label, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_width(s_standby_time_label, TFT_W);
+    lv_obj_set_style_text_font(s_standby_time_label, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(s_standby_time_label, C_WHITE, 0);
+    lv_obj_set_style_text_align(s_standby_time_label, LV_TEXT_ALIGN_CENTER, 0);
+    /* 放大 2 倍 (scale = 512, 100% = 256) */
+    lv_obj_set_style_transform_scale(s_standby_time_label, 512, 0);
+    lv_obj_set_style_transform_pivot_x(s_standby_time_label, TFT_W / 2, 0);
+    lv_obj_set_style_transform_pivot_y(s_standby_time_label, lv_pct(50), 0);
+    lv_obj_align(s_standby_time_label, LV_ALIGN_CENTER, 0, 0);
+
+    _update_standby_time();
+}
+
+static void _show_standby_screen(void)
+{
+    if (!s_standby_scr) {
+        _create_standby_screen();
+    }
+    if (lv_scr_act() == s_standby_scr) {
+        return;
+    }
+
+    _show_status_panel(false);
+    _hide_capsule_popup();
+    _show_return_bar(false);
+
+    lv_obj_t *current = lv_scr_act();
+    if (current && current != s_standby_scr) {
+        s_parent_screen = current;
+    } else {
+        s_parent_screen = s_main_scr;
+    }
+
+    _update_standby_time();
+    lv_scr_load(s_standby_scr);
+    ESP_LOGI(TAG, "Entered standby clock screen");
+}
+
 static void _show_parent_screen(void)
 {
     lv_obj_t *current = lv_scr_act();
+    if (current == s_standby_scr) {
+        lv_obj_t *target = s_parent_screen ? s_parent_screen : s_main_scr;
+        s_parent_screen = NULL;
+        lv_scr_load(target);
+        return;
+    }
     if (current == s_softap_scr) _show_wlan();
     else if (current == s_wlan_password_scr) _show_wlan();
     else if (current == s_wlan_scr || current == s_lyrics_scr) _show_main_screen();
@@ -2041,7 +2124,8 @@ static void _gesture_timer_cb(lv_timer_t *timer)
         if (!s_status_visible && y < GESTURE_EDGE_PX &&
             lv_scr_act() != s_wlan_scr &&
             lv_scr_act() != s_softap_scr &&
-            lv_scr_act() != s_wlan_password_scr) {
+            lv_scr_act() != s_wlan_password_scr &&
+            lv_scr_act() != s_standby_scr) {
             s_gesture.mode = GESTURE_MODE_STATUS_OPEN;
             s_gesture.active = true;
             lv_obj_clear_flag(s_status_panel, LV_OBJ_FLAG_HIDDEN);
@@ -2051,6 +2135,7 @@ static void _gesture_timer_cb(lv_timer_t *timer)
             s_gesture.mode = GESTURE_MODE_STATUS_CLOSE;
             s_gesture.active = true;
         } else if (!s_status_visible && lv_scr_act() != s_main_scr &&
+                   lv_scr_act() != s_standby_scr &&
                    y >= TFT_H - GESTURE_EDGE_PX) {
             s_gesture.mode = GESTURE_MODE_RETURN;
             s_gesture.active = true;
@@ -2126,6 +2211,20 @@ static void _wifi_status_timer_cb(lv_timer_t *timer)
     _apply_wlan_scan_results();
     _update_system_status();
     _maybe_return_after_provision();
+
+    /* 息屏时钟页面显示时，保持每秒更新时间 */
+    if (lv_scr_act() == s_standby_scr) {
+        _update_standby_time();
+    } else {
+        /* 如果没有在播放音乐（s_last_ui_state != 1），且两分钟（120秒）无人操作，则进入息屏显示 */
+        if (s_last_ui_state != 1) {
+            uint32_t inactive_ms = lv_display_get_inactive_time(NULL);
+            if (inactive_ms >= 120000) {
+                ESP_LOGI(TAG, "Inactive time reached %u ms, entering standby clock", (unsigned)inactive_ms);
+                _show_standby_screen();
+            }
+        }
+    }
 }
 
 /* 配网成功后自动返回 WLAN 页（从软AP页/密码页），只触发一次 */
@@ -2328,6 +2427,7 @@ void lvgl_port_ui_create(void)
     _create_wlan_screen();
     _create_softap_screen();
     _create_wlan_password_screen();
+    _create_standby_screen();
     _create_system_ui();
     s_gesture_timer = lv_timer_create(_gesture_timer_cb, 20, NULL);
     s_wifi_status_timer = lv_timer_create(_wifi_status_timer_cb, 1000, NULL);
@@ -2556,6 +2656,14 @@ static void _animate_citou(int target_angle)
 void lvgl_port_ui_set_state(int state) {
     if (state == s_last_ui_state) return;  /* 状态没变，跳过 */
     s_last_ui_state = state;
+
+    /* 如果开始播放，退出息屏时钟页面 */
+    if (state == 1) {
+        if (lv_scr_act() == s_standby_scr) {
+            ESP_LOGI(TAG, "Music started playing, waking up from standby screen");
+            _show_parent_screen();
+        }
+    }
 
     if (state == 1) {
         lv_imgbtn_set_src(s_btn_play, LV_IMGBTN_STATE_RELEASED, NULL, &ui_img_zanting1_png, NULL);

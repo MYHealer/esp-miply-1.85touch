@@ -23,6 +23,60 @@
 
 static const char *TAG = "LYRIC";
 
+/* ── 统一的"可唱字符"判定 ──
+ * 三处调用方（伪klyric生成 / 总字数统计 / 逐字映射）必须用同一套标准，
+ * 否则同一个字符一边计入 word entry、一边被跳过，高亮就会整体偏移。
+ * 不可唱 = ASCII标点空白 + 全角ASCII区(U+FF01..FF5E) + CJK标点区(U+3000..U+300F)。
+ * 返回该字符的 UTF-8 字节数。 */
+static int lyric_char_bytes(unsigned char c, bool *is_sung)
+{
+    int bytes = 1;
+    bool sung = true;
+    if (c >= 0xE0) {
+        bytes = 3;
+    } else if (c >= 0xC0) {
+        bytes = 2;
+    } else {
+        /* ASCII 标点/空白不可唱 */
+        if (c == ' ' || c == ',' || c == '.' || c == '!' || c == '?' ||
+            c == ';' || c == ':' || c == '-' || c == '\'' || c == '"') {
+            sung = false;
+        }
+    }
+    if (is_sung) *is_sung = sung;
+    return bytes;
+}
+
+/* 结合后续字节判断全角/CJK 标点（需传入当前字符指针） */
+static bool lyric_is_sung_char(const char *p, int *bytes_out)
+{
+    unsigned char c = (unsigned char)*p;
+    bool sung = true;
+    int bytes = lyric_char_bytes(c, &sung);
+
+    if (bytes == 3 && sung) {
+        /* 全角 ASCII 区 U+FF01..FF5E（ＥＦ BC 81..BF）→ 不可唱 */
+        if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBC) {
+            unsigned char c2 = (unsigned char)p[2];
+            if (c2 >= 0x81 && c2 <= 0xBF) sung = false;
+        }
+        /* CJK 标点区 U+3000..U+301F（E3 80 80..9F / E3 81 ..） */
+        if ((unsigned char)p[0] == 0xE3 && (unsigned char)p[1] == 0x80) {
+            unsigned char c2 = (unsigned char)p[2];
+            if (c2 >= 0x80 && c2 <= 0x9F) sung = false;
+        }
+        /* 中文标点 ，。！？；：、… 落在 U+3000 段或全角段，已覆盖；
+         * 补充 U+2026(…) / U+2014(—) 等常用省略号破折号 */
+        if ((unsigned char)p[0] == 0xE2 && (unsigned char)p[1] == 0x80) {
+            unsigned char c2 = (unsigned char)p[2];
+            if (c2 == 0xA6 || c2 == 0x94) sung = false;   /* … — */
+        }
+    }
+    if (bytes_out) *bytes_out = bytes;
+    return sung;
+}
+
+
 /* ── 静态数据 ── */
 static EXT_RAM_BSS_ATTR lyric_data_t     s_lyric_data;
 static SemaphoreHandle_t s_mutex;
@@ -30,7 +84,10 @@ static TaskHandle_t      s_fetch_task;
 static uint32_t          s_fetch_gen;
 
 /* ── klyric 逐字时间戳（扁平数组，共 ~2.5KB）── */
-#define KLYRIC_MAX_WORDS   256
+/* 容量按"128 行 × 平均 12 字"估算。原来 256 字只够 ~25 行，
+ * 一首 44 行的歌会在中途撑满，后半首完全没有逐字数据。
+ * 三个数组都在 PSRAM（EXT_RAM_BSS_ATTR），扩到 1536 只多占 ~12KB。 */
+#define KLYRIC_MAX_WORDS   1536
 static EXT_RAM_BSS_ATTR int  s_klyric_start[KLYRIC_MAX_WORDS];   /* 每个字的绝对起始毫秒 */
 static EXT_RAM_BSS_ATTR int  s_klyric_end[KLYRIC_MAX_WORDS];     /* 每个字的绝对结束毫秒 */
 static int  s_klyric_count;                     /* 总字数 */
@@ -82,8 +139,12 @@ static BaseType_t lyrics_create_task(TaskFunction_t task, const char *name,
 static void parse_klyric(const char *klyric_text);
 
 /* ── HTTP 响应缓冲 ── */
-#define HTTP_SEARCH_BUF          8192   /* limit=8 多候选搜索响应可达 4KB+ */
-#define HTTP_FALLBACK_SEARCH_BUF  16384
+/* 初始缓冲；http_event_handler 会在不够时自动 realloc 扩容，
+ * 所以这里给个常见值即可，不必按最大响应预留。
+ * 历史 bug：cloudsearch 响应实测 12579 字节，而搜索缓冲只有 8192，
+ * 数据被静默截断 → 无效 JSON → NetEase 全部失败 → 退到 Kuwo 二手歌词。 */
+#define HTTP_SEARCH_BUF          16384
+#define HTTP_FALLBACK_SEARCH_BUF 16384
 #define HTTP_LYRIC_BUF           32768
 
 typedef struct {
@@ -120,11 +181,23 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
     resp_ctx_t *ctx = (resp_ctx_t *)evt->user_data;
     switch (evt->event_id) {
     case HTTP_EVENT_ON_DATA:
-        if (ctx->len + evt->data_len < ctx->cap) {
-            memcpy(ctx->buf + ctx->len, evt->data, evt->data_len);
-            ctx->len += evt->data_len;
-            ctx->buf[ctx->len] = '\0';
+        /* 缓冲不足时按需扩容（cloudsearch 响应实测 12.5KB，远超原 8KB 缓冲）。
+         * 旧实现静默丢弃多余数据，导致截断的 JSON 解析失败却毫无提示。 */
+        if (ctx->len + evt->data_len + 1 > ctx->cap) {
+            int need = ctx->len + evt->data_len + 1;
+            int new_cap = ctx->cap;
+            while (new_cap < need) new_cap *= 2;
+            char *nb = realloc(ctx->buf, new_cap);
+            if (!nb) {
+                ESP_LOGW(TAG, "resp buffer grow failed (need %d), truncating", need);
+                break;
+            }
+            ctx->buf = nb;
+            ctx->cap = new_cap;
         }
+        memcpy(ctx->buf + ctx->len, evt->data, evt->data_len);
+        ctx->len += evt->data_len;
+        ctx->buf[ctx->len] = '\0';
         break;
     default:
         break;
@@ -137,10 +210,8 @@ static char *http_request_ex(const char *url, const char *post_data,
                              const char *content_type, int buf_size,
                              const char *referer)
 {
-    char *buf = malloc(buf_size);
-    if (!buf) return NULL;
-
-    resp_ctx_t ctx = { .buf = buf, .len = 0, .cap = buf_size };
+    resp_ctx_t ctx = { .buf = malloc(buf_size), .len = 0, .cap = buf_size };
+    if (!ctx.buf) return NULL;
 
     esp_http_client_config_t cfg = {
         .url = url,
@@ -153,7 +224,7 @@ static char *http_request_ex(const char *url, const char *post_data,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (!client) { free(buf); return NULL; }
+    if (!client) { free(ctx.buf); return NULL; }
 
     esp_http_client_set_header(client, "User-Agent",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120");
@@ -173,7 +244,7 @@ static char *http_request_ex(const char *url, const char *post_data,
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "HTTP perform failed: %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
-        free(buf);
+        free(ctx.buf);
         return NULL;
     }
 
@@ -185,16 +256,21 @@ static char *http_request_ex(const char *url, const char *post_data,
 
     if (status != 200) {
         ESP_LOGE(TAG, "HTTP status %d", status);
-        free(buf);
+        free(ctx.buf);
         return NULL;
+    }
+
+    if (content_length > 0 && ctx.len < content_length) {
+        ESP_LOGW(TAG, "response TRUNCATED: got %d of %d bytes (url=%.64s)",
+                 ctx.len, content_length, url);
     }
 
     if (ctx.len == 0) {
-        free(buf);
+        free(ctx.buf);
         return NULL;
     }
 
-    return buf;
+    return ctx.buf;
 }
 
 static char *http_request(const char *url, const char *post_data,
@@ -226,6 +302,38 @@ static int json_find_key(const char *json, jsmntok_t *tokens, int num_tokens,
                 skip--;
             }
             i += skip;
+        }
+    }
+    return -1;
+}
+
+/* forward declaration */
+static int jsmn_container_end(const jsmntok_t *tokens, int num, int idx);
+
+/* ── 在容器的直接子 key 中查找（不递归进入子容器） ── */
+static int json_find_key_in_object(const char *json, jsmntok_t *tokens, int num_tokens,
+                                   int container_idx, const char *key)
+{
+    if (container_idx < 0 || container_idx >= num_tokens) return -1;
+    if (tokens[container_idx].type != JSMN_OBJECT) return -1;
+    int key_len = strlen(key);
+    int end = jsmn_container_end(tokens, num_tokens, container_idx);
+    int i = container_idx + 1;
+    while (i < end && i < num_tokens) {
+        if (tokens[i].type == JSMN_STRING) {
+            int len = tokens[i].end - tokens[i].start;
+            if (len == key_len && memcmp(json + tokens[i].start, key, len) == 0) {
+                return i + 1;  /* 返回 value 的 token 索引 */
+            }
+        }
+        /* 跳过这个 key-value 对 */
+        i++;  /* skip key */
+        if (i < end && i < num_tokens) {
+            if (tokens[i].type == JSMN_OBJECT || tokens[i].type == JSMN_ARRAY) {
+                i = jsmn_container_end(tokens, num_tokens, i);
+            } else {
+                i++;  /* skip primitive value */
+            }
         }
     }
     return -1;
@@ -312,24 +420,30 @@ static unsigned long search_parse_best(const char *resp, const char *clean_title
      * jsmntok_t 约 16 字节，1024 个 = 16KB，放在此任务自己的 PSRAM 栈上没问题
      * （lyric_fetch 任务栈 48KB PSRAM）。 */
     jsmn_parser parser;
-    jsmntok_t *tokens = malloc(sizeof(jsmntok_t) * 1024);
+    jsmntok_t *tokens = malloc(sizeof(jsmntok_t) * 4096);
     if (!tokens) {
         ESP_LOGE(TAG, "token array alloc failed");
         return 0;
     }
     jsmn_init(&parser);
-    int num = jsmn_parse(&parser, resp, strlen(resp), tokens, 1024);
+    int num = jsmn_parse(&parser, resp, strlen(resp), tokens, 4096);
     if (num < 0) {
         ESP_LOGE(TAG, "JSON parse error: %d", num);
         free(tokens);
         return 0;
     }
 
-    /* result.songs[] */
+    /* result.songs[] — 必须在 result 对象的直接子 key 中找 songs，
+     * 不能用线性扫描（会命中嵌套对象内部的同名 key） */
     int ri = json_find_key(resp, tokens, num, 0, "result");
-    if (ri < 0) { free(tokens); return 0; }
-    int si = json_find_key(resp, tokens, num, ri, "songs");
+    if (ri < 0 || tokens[ri].type != JSMN_OBJECT) { free(tokens); return 0; }
+    int si = json_find_key_in_object(resp, tokens, num, ri, "songs");
     if (si < 0) { free(tokens); return 0; }
+    ESP_LOGI(TAG, "ri=%d(ri_type=%d) si=%d(si_type=%d) si-1_type=%d si-1_str='%.*s'",
+             ri, tokens[ri].type, si, tokens[si].type,
+             si-1 >= 0 ? tokens[si-1].type : -1,
+             si-1 >= 0 ? tokens[si-1].end - tokens[si-1].start : 0,
+             si-1 >= 0 ? resp + tokens[si-1].start : "");
     if (tokens[si].type != JSMN_ARRAY || tokens[si].size < 1) {
         free(tokens);
         return 0;
@@ -341,13 +455,32 @@ static unsigned long search_parse_best(const char *resp, const char *clean_title
      * cloudsearch 这类深嵌套响应会算错 obj_end → 解析出 id=0。 */
     int song_count = tokens[si].size;
     int pos = si + 1;  /* songs 数组第一个元素 */
+    /* dump songs 数组第一个元素的原始 JSON */
+    if (pos < num && tokens[pos].type == JSMN_OBJECT) {
+        int dlen = tokens[pos].end - tokens[pos].start;
+        if (dlen > 200) dlen = 200;
+        ESP_LOGI(TAG, "songs[0] raw (%d): %.*s", dlen, dlen, resp + tokens[pos].start);
+    } else if (pos < num) {
+        ESP_LOGI(TAG, "songs[0] pos=%d type=%d, skip to %d", pos, tokens[pos].type, pos+1 < num ? tokens[pos+1].type : -1);
+        /* 如果第一个 token 不是 OBJECT（可能是 ARRAY 自身），跳过 */
+        if (tokens[pos].type == JSMN_ARRAY) pos++;
+    }
     unsigned long best_id = 0;
     char best_name[64] = "";
     int best_score = -1;
+    ESP_LOGI(TAG, "search_parse_best: %d candidates for '%.32s' (tokens=%d, resp_len=%d)",
+             song_count, clean_title, num, (int)strlen(resp));
+    if (song_count < 1) {
+        ESP_LOGW(TAG, "no song candidate; resp head: %.120s", resp);
+    }
 
     for (int s = 0; s < song_count && pos < num; s++) {
         if (tokens[pos].type != JSMN_OBJECT) { pos++; continue; }
-        int obj_end = jsmn_container_end(tokens, num, pos);
+        /* 字符边界法：jsmn 的 size 对嵌套容器不是可靠的子树长度 */
+        int obj_end = pos + 1;
+        while (obj_end < num && tokens[obj_end].start < tokens[pos].end) {
+            obj_end++;
+        }
 
         /* 在这个 object 内找顶层 "id" 和 "name"（只看直接子 key） */
         unsigned long song_id = 0;
@@ -356,10 +489,16 @@ static unsigned long search_parse_best(const char *resp, const char *clean_title
         while (scan < obj_end && scan < num) {
             int klen = tokens[scan].end - tokens[scan].start;
             if (tokens[scan].type == JSMN_STRING) {
-                /* 顶层 "id" key（值必须是 PRIMITIVE 数字，杜绝嵌套对象里的字符串 id） */
+                /* 顶层 "id" key（值可以是 PRIMITIVE 数字或 STRING） */
                 if (klen == 2 && memcmp(resp + tokens[scan].start, "id", 2) == 0
-                    && scan + 1 < num && tokens[scan + 1].type == JSMN_PRIMITIVE) {
-                    song_id = json_get_int(resp, &tokens[scan + 1]);
+                    && scan + 1 < num) {
+                    if (tokens[scan + 1].type == JSMN_PRIMITIVE) {
+                        song_id = json_get_int(resp, &tokens[scan + 1]);
+                    } else if (tokens[scan + 1].type == JSMN_STRING) {
+                        char id_buf[32];
+                        json_get_string(resp, &tokens[scan + 1], id_buf, sizeof(id_buf));
+                        song_id = strtoul(id_buf, NULL, 10);
+                    }
                 }
                 /* 顶层 "name" key（值必须是 STRING） */
                 if (klen == 4 && memcmp(resp + tokens[scan].start, "name", 4) == 0
@@ -367,15 +506,16 @@ static unsigned long search_parse_best(const char *resp, const char *clean_title
                     json_get_string(resp, &tokens[scan + 1], song_name, sizeof(song_name));
                 }
             }
-            /* 跳过 key + value 对；value 是容器时按其真实宽度跳 */
+            /* 跳过 key + value；value 是容器时按字符边界跳 */
+            int value = scan + 1;
             scan += 2;
-            if (scan - 1 < num && (tokens[scan - 1].type == JSMN_OBJECT || tokens[scan - 1].type == JSMN_ARRAY)) {
-                scan = jsmn_container_end(tokens, num, scan - 1);
+            while (scan < obj_end && scan < num
+                   && tokens[scan].start < tokens[value].end) {
+                scan++;
             }
         }
 
-
-        ESP_LOGI(TAG, "song[%d]: id=%d name='%s'", s, song_id, song_name);
+        ESP_LOGI(TAG, "song[%d]: id=%lu name='%s'", s, song_id, song_name);
         if (song_id > 0) {
             /* 打分：候选歌名与清洗后目标歌名的匹配度 */
             int score = 0;
@@ -406,7 +546,7 @@ static unsigned long search_parse_best(const char *resp, const char *clean_title
     }
 
     if (best_id > 0) {
-        ESP_LOGI(TAG, "Found: [%d] %s (score=%d)", best_id, best_name, best_score);
+        ESP_LOGI(TAG, "Found: [%lu] %s (score=%d)", best_id, best_name, best_score);
     } else {
         ESP_LOGW(TAG, "Song not found in this endpoint");
     }
@@ -558,7 +698,9 @@ static char *fetch_lrc(unsigned long song_id)
 }
 
 /* ── 从 LRC 行数据生成近似逐字时间戳（无 klyric 时的回退）──
- * 策略：按行时长均分到每个字，标点处额外停顿 */
+ * 策略：按行时长均分到每个可唱字，标点不产生 word entry（避免与
+ *       lyrics_get_karaoke_byte_idx 的标点跳过逻辑产生字数不匹配）。
+ *       标点的时间权重分摊到同行可唱字中。 */
 static void generate_pseudo_klyric(const lyric_data_t *data)
 {
     if (s_klyric_count > 0 || !data || data->count < 2) return;
@@ -595,56 +737,47 @@ static void generate_pseudo_klyric(const lyric_data_t *data)
         int line_dur = line_end - line_start;
         if (line_dur <= 0) line_dur = 3000;
 
-        /* 统计"权重"：中文=1，英文=0.5，标点=0.3 */
-        float total_weight = 0;
+        /* 计算可唱字符的总权重（用于分配时间） — 用统一判定 */
+        float sung_weight = 0;
         const char *p = text;
         while (*p) {
-            unsigned char c = (unsigned char)*p;
-            if (c >= 0xE0) { total_weight += 1.0f; p += 3; }       /* CJK 3字节 */
-            else if (c >= 0xC0) { total_weight += 1.0f; p += 2; }  /* 2字节 UTF-8 */
-            else {
-                if (c == ' ' || c == ',' || c == '.' || c == '!' || c == '?' ||
-                    c == ';' || c == ':' || c == '-' || c == '，' || c == '。' ||
-                    c == '！' || c == '？' || c == '；' || c == '、' || c == '…') {
-                    total_weight += 0.3f;
-                } else {
-                    total_weight += 0.5f;  /* ASCII 字母 */
-                }
-                p++;
+            int bytes = 1;
+            if (lyric_is_sung_char(p, &bytes)) {
+                sung_weight += (bytes >= 2) ? 1.0f : 0.5f;
             }
+            p += bytes;
         }
-        if (total_weight < 1) total_weight = 1;
+        if (sung_weight < 1) sung_weight = 1;
+
+        /* 标点的时间分摊系数：总时长按可唱权重比例分配 */
+        float time_per_sung_weight = (float)line_dur / sung_weight;
 
         s_klyric_line_first[line_idx] = word_idx;
         s_klyric_line_time[line_idx] = line_start;
         line_idx++;
 
-        /* 逐字分配时间 */
-        float time_per_weight = (float)line_dur / total_weight;
+        /* 逐字分配时间 — 只为可唱字符创建 word entry（统一判定） */
         int t = line_start;
         p = text;
         while (*p && word_idx < KLYRIC_MAX_WORDS - 1) {
-            unsigned char c = (unsigned char)*p;
             int char_bytes = 1;
-            float w;
-            if (c >= 0xE0) { char_bytes = 3; w = 1.0f; }
-            else if (c >= 0xC0) { char_bytes = 2; w = 1.0f; }
-            else {
-                if (c == ' ' || c == ',' || c == '.' || c == '!' || c == '?' ||
-                    c == ';' || c == ':' || c == '-' || c == '，' || c == '。' ||
-                    c == '！' || c == '？' || c == '；' || c == '、' || c == '…') {
-                    w = 0.3f;
-                } else {
-                    w = 0.5f;
-                }
-            }
-            int dur = (int)(w * time_per_weight);
-            if (dur < 50) dur = 50;
+            bool is_sung = lyric_is_sung_char(p, &char_bytes);
 
-            s_klyric_start[word_idx] = t;
-            s_klyric_end[word_idx] = t + dur;
-            word_idx++;
-            t += dur;
+            if (!is_sung) {
+                /* 标点不产生 word entry，只消耗一点时间让后续字延后（停顿感） */
+                int punct_dur = (int)(0.3f * time_per_sung_weight);
+                if (punct_dur < 30) punct_dur = 30;
+                if (punct_dur > 300) punct_dur = 300;
+                t += punct_dur;
+            } else {
+                float w = (char_bytes >= 2) ? 1.0f : 0.5f;
+                int dur = (int)(w * time_per_sung_weight);
+                if (dur < 50) dur = 50;
+                s_klyric_start[word_idx] = t;
+                s_klyric_end[word_idx] = t + dur;
+                word_idx++;
+                t += dur;
+            }
 
             p += char_bytes;
         }
@@ -652,7 +785,16 @@ static void generate_pseudo_klyric(const lyric_data_t *data)
 
     s_klyric_count = word_idx;
     s_klyric_line_count = line_idx;
-    ESP_LOGI(TAG, "Pseudo-klyric: %d words across %d lines", s_klyric_count, s_klyric_line_count);
+    ESP_LOGI(TAG, "Pseudo-klyric: %d words across %d lines (punct skipped)", s_klyric_count, s_klyric_line_count);
+    /* 前 5 行详情 */
+    for (int li = 0; li < s_klyric_line_count && li < 5; li++) {
+        int wf = s_klyric_line_first[li];
+        int wl = (li + 1 < s_klyric_line_count) ? s_klyric_line_first[li + 1] : s_klyric_count;
+        ESP_LOGI(TAG, "  pseudo[%d]: t=%d words=%d t0=%d txt=%.16s",
+                 li, s_klyric_line_time[li], wl - wf,
+                 wl > wf ? s_klyric_start[wf] : -1,
+                 data->lines[li].text);
+    }
 }
 
 /* ── 解析 LRC 格式 "[MM:SS.xx]text" ── */
@@ -730,7 +872,9 @@ static void parse_lrc(const char *lrc_text, lyric_data_t *data)
 
 /* ── 解析 klyric/yrc 逐字时间戳 ──
  * klyric 格式: [line_start,dur](offset,dur)word...  （offset 相对前一字末尾）
- * yrc 格式:    [line_start,dur](start,dur,0)word...  （start 绝对毫秒）
+ * yrc 格式:    [line_start,dur](offset,dur,0)word...  （offset 相对行头 line_start）
+ * 两种格式的字时间都是相对量，需加上行起始才是绝对毫秒。
+ * （Lyricon 反编译验证：hk.begin 存原始偏移，UI 端 + line.begin = 绝对时间）
  */
 static void parse_klyric(const char *klyric_text)
 {
@@ -752,8 +896,7 @@ static void parse_klyric(const char *klyric_text)
                 if (!rp) { p++; continue; }
                 rp++;
 
-                /* yrc 格式用绝对时间，klyric 格式用相对偏移 */
-                bool is_yrc = false;
+                /* klyric 2-param 格式用 word_time 累加相对偏移 */
                 int word_time = line_start;
                 while (*rp && *rp != '\n' && *rp != '\r' && s_klyric_count < KLYRIC_MAX_WORDS) {
                     if (*rp != '(') { rp++; continue; }
@@ -761,19 +904,19 @@ static void parse_klyric(const char *klyric_text)
                     int a = 0, b = 0, c = 0;
                     int n = sscanf(rp, "(%d,%d,%d)", &a, &b, &c);
                     if (n == 3) {
-                        /* yrc 格式: (start,dur,flag) — start 是绝对毫秒 */
-                        if (!is_yrc) {
-                            is_yrc = true;
-                            word_time = line_start;
-                        }
-                        /* dur<=0 时兜底（对齐 LyricOn: dur==0 → end-start，
-                         * 保证每个字至少有点时长，karaoke 不会瞬间跳过） */
-                        int end = a + b;
+                        /* yrc 格式: (offset,dur,flag) — offset 相对行头起始时间！
+                         * 实测网易云 YRC: [15634,4457](240,306,0)谁
+                         *   → 字绝对起始 = 15634 + 240 = 15874ms
+                         * Lyricon 反编译确认: hk.begin = raw_offset（不加 line_start），
+                         * 其 UI 消费端自行加行起始。我们在解析时直接转绝对时间。 */
+                        int abs_start = line_start + a;
+                        int end = abs_start + b;
+                        /* dur<=0 时兜底（保证每个字至少有点时长，karaoke 不会瞬间跳过） */
                         if (b <= 0) {
-                            if (end > a) b = end - a;
-                            else { b = 1; end = a + 1; }
+                            b = 1;
+                            end = abs_start + 1;
                         }
-                        s_klyric_start[s_klyric_count] = a;
+                        s_klyric_start[s_klyric_count] = abs_start;
                         s_klyric_end[s_klyric_count] = end;
                         s_klyric_count++;
                         rp = strchr(rp, ')');
@@ -782,20 +925,16 @@ static void parse_klyric(const char *klyric_text)
                         while (*rp && *rp != '(' && *rp != '\n' && *rp != '\r') rp++;
                     } else if (sscanf(rp, "(%d,%d)", &a, &b) >= 2) {
                         /* klyric 格式: (offset,dur) — offset 相对前一字末尾 */
-                        if (!is_yrc) {
-                            word_time += a;
-                            int end = word_time + b;
-                            if (b <= 0) {   /* dur<=0 兜底，避免 0 时长字 */
-                                if (end > word_time) b = end - word_time;
-                                else { b = 1; end = word_time + 1; }
-                            }
-                            s_klyric_start[s_klyric_count] = word_time;
-                            s_klyric_end[s_klyric_count] = word_time + b;
-                            s_klyric_count++;
-                            word_time += b;
-                        } else {
-                            /* yrc 中也可能有 2 参数格式，跳过 */
+                        word_time += a;
+                        int end = word_time + b;
+                        if (b <= 0) {   /* dur<=0 兜底，避免 0 时长字 */
+                            if (end > word_time) b = end - word_time;
+                            else { b = 1; end = word_time + 1; }
                         }
+                        s_klyric_start[s_klyric_count] = word_time;
+                        s_klyric_end[s_klyric_count] = word_time + b;
+                        s_klyric_count++;
+                        word_time += b;
                         rp = strchr(rp, ')');
                         if (!rp) break;
                         rp++;
@@ -1152,17 +1291,49 @@ static bool apply_lrc(char *lrc, lyric_data_t *data, uint32_t gen)
     memset(s_lrc_to_klyric, -1, sizeof(s_lrc_to_klyric));
     if (s_klyric_line_count > 0 && data->count > 0) {
         int ki = 0;
+        int mapped = 0, unmapped = 0;
         for (int li = 0; li < data->count; li++) {
             int lrc_time = data->lines[li].time_ms;
+            /* 每行独立找时间最接近的 klyric 行，不再用全局递增的 ki。
+             * 真实 yrc 常含翻译行/空行导致行数不等，贪心递增一旦错过一行，
+             * 后续会整体错位一格——这正是"逐字高亮快了一句"的来源。
+             * 只向前搜索（klyric 行不倒退），保证单调性。 */
             while (ki < s_klyric_line_count - 1 &&
                    abs(s_klyric_line_time[ki + 1] - lrc_time) < abs(s_klyric_line_time[ki] - lrc_time)) {
                 ki++;
             }
+            /* 若当前 ki 已明显超前（差值过大），回退到本行最优解 */
+            if (ki > 0 && abs(s_klyric_line_time[ki] - lrc_time) > 100) {
+                int best = ki;
+                int best_diff = abs(s_klyric_line_time[ki] - lrc_time);
+                for (int kj = ki - 1; kj >= 0; kj--) {
+                    int d = abs(s_klyric_line_time[kj] - lrc_time);
+                    if (d < best_diff) { best_diff = d; best = kj; }
+                }
+                if (best_diff <= 100) ki = best;
+            }
             if (ki < s_klyric_line_count && abs(s_klyric_line_time[ki] - lrc_time) <= 100) {
                 s_lrc_to_klyric[li] = ki;
+                mapped++;
+            } else {
+                unmapped++;
             }
         }
+        ESP_LOGI(TAG, "LRC→klyric mapping: %d mapped, %d unmapped (LRC=%d klyric=%d)",
+                 mapped, unmapped, data->count, s_klyric_line_count);
+        /* 前 5 行映射详情 */
+        for (int li = 0; li < data->count && li < 5; li++) {
+            int ki = s_lrc_to_klyric[li];
+            ESP_LOGI(TAG, "  map[%d]: lrc_t=%d → kline=%d kt=%d txt=%.16s",
+                     li, data->lines[li].time_ms, ki,
+                     ki >= 0 ? s_klyric_line_time[ki] : -1,
+                     data->lines[li].text);
+        }
     }
+    ESP_LOGI(TAG, "Applied %d lyric lines: first=%dms last=%dms '%.24s' ... '%.24s'",
+             data->count, data->lines[0].time_ms,
+             data->lines[data->count - 1].time_ms,
+             data->lines[0].text, data->lines[data->count - 1].text);
     xSemaphoreGive(s_mutex);
     free(lrc);
     return true;
@@ -1465,35 +1636,15 @@ int lyrics_get_karaoke_byte_idx(int line_idx, const char *line_text, int pos_ms)
     sung_words = (found < 0) ? 0 : (found - first + 1);
     if (sung_words > word_count) sung_words = word_count;
 
+    int first_word_start = (word_count > 0) ? s_klyric_start[first] : -1;
     xSemaphoreGive(s_mutex);
 
-    /* 统计 line_text 中的可唱字符总数 */
+    /* 统计 line_text 中的可唱字符总数（统一判定） */
     int total_sung = 0;
     const char *t = line_text;
     while (*t) {
-        unsigned char c = (unsigned char)*t;
-        bool is_sung = true;
         int bytes = 1;
-        if (c >= 0xE0) {
-            bytes = 3;
-            if (t[0] == (char)0xEF && t[1] == (char)0xBC) {
-                unsigned char c2 = (unsigned char)t[2];
-                if (c2 >= 0x81 && c2 <= 0x9F) is_sung = false;
-                if (c2 >= 0xA1 && c2 <= 0xB0) is_sung = false;
-            }
-            if (t[0] == (char)0xE3 && t[1] == (char)0x80) {
-                unsigned char c2 = (unsigned char)t[2];
-                if (c2 >= 0x80 && c2 <= 0x8F) is_sung = false;
-            }
-        } else if (c >= 0xC0) {
-            bytes = 2;
-        } else {
-            if (c == ' ' || c == ',' || c == '.' || c == '!' || c == '?' ||
-                c == ';' || c == ':' || c == '-' || c == '\'' || c == '"') {
-                is_sung = false;
-            }
-        }
-        if (is_sung) total_sung++;
+        if (lyric_is_sung_char(t, &bytes)) total_sung++;
         t += bytes;
     }
 
@@ -1502,32 +1653,22 @@ int lyrics_get_karaoke_byte_idx(int line_idx, const char *line_text, int pos_ms)
      * 让高亮覆盖到"正在唱"的那个字。 */
     int target_char = sung_words;
     if (target_char > total_sung) target_char = total_sung;
+
+    /* 诊断日志：仅在字数变化时打印（避免 25Hz 刷屏） */
+    static int s_last_sung = -1, s_last_line = -1;
+    if (sung_words != s_last_sung || line_idx != s_last_line) {
+        ESP_LOGI("KLIDX", "line=%d kline=%d wc=%d/%d sw=%d tgt=%d pos=%d t0=%d txt=%.16s",
+                 line_idx, kline, word_count, total_sung, sung_words,
+                 target_char, pos_ms, first_word_start, line_text);
+        s_last_sung = sung_words;
+        s_last_line = line_idx;
+    }
+
     const char *p = line_text;
     int char_count = 0;
     while (*p && char_count < target_char) {
-        unsigned char c = (unsigned char)*p;
-        bool is_sung = true;
         int bytes = 1;
-        if (c >= 0xE0) {
-            bytes = 3;
-            if (p[0] == (char)0xEF && p[1] == (char)0xBC) {
-                unsigned char c2 = (unsigned char)p[2];
-                if (c2 >= 0x81 && c2 <= 0x9F) is_sung = false;
-                if (c2 >= 0xA1 && c2 <= 0xB0) is_sung = false;
-            }
-            if (p[0] == (char)0xE3 && p[1] == (char)0x80) {
-                unsigned char c2 = (unsigned char)p[2];
-                if (c2 >= 0x80 && c2 <= 0x8F) is_sung = false;
-            }
-        } else if (c >= 0xC0) {
-            bytes = 2;
-        } else {
-            if (c == ' ' || c == ',' || c == '.' || c == '!' || c == '?' ||
-                c == ';' || c == ':' || c == '-' || c == '\'' || c == '"') {
-                is_sung = false;
-            }
-        }
-        if (is_sung) char_count++;
+        if (lyric_is_sung_char(p, &bytes)) char_count++;
         p += bytes;
     }
 

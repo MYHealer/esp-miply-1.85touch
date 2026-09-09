@@ -123,6 +123,9 @@ static int           s_user_stopped      = 0;
 static int64_t       s_stuck_paused_since = 0;
 /* 歌词 UI 清除请求（新歌切歌时，UI 任务处理） */
 static volatile bool s_lyrics_ui_clear_pending = false;
+/* 歌词补取：会话重置/中途投屏后字段被清空，等标题到达时必须重新抓歌词。
+ * 不然"播到一半再投屏"时手机只上报 position，永远等不到 new_track → 暂无歌词。 */
+static volatile bool s_lyrics_refetch_pending = false;
 /* 小米音箱模式：HyperAll REMOTE_SUBMIX 音频接管 */
 static volatile bool s_xiaomi_speaker_mode = false;
 /* MiPlay 媒体事件由网络任务投递，统一在 UI 任务中消费。 */
@@ -570,6 +573,38 @@ static int cb_get_duration_sec(void)
 }
 
 static int cb_get_volume(void) { return s_mute ? 0 : s_vol; }
+
+/* ── 音量百分比 → ALC 增益(dB) 感知曲线 ──
+ * 原来的 -(100-v)^2*30/10000 是"反向"的：低音量区斜率太平（1%→10% 只差 5dB），
+ * 且 100% 就到顶，浪费了 ALC 的正增益余量。
+ * 改为对数型感知曲线（人耳响度近似 dB 线性）：
+ *   - 低音量压得更低（1% ≈ -63dB，原来只有 -29dB）
+ *   - 高音量给正增益（100% = +6dB，原来是 0dB）
+ * ALC 合法范围 [-64, 63]，低于 -64 视为静音。表内线性插值。 */
+static const int8_t s_vol_curve[11] = {
+    -64,  /*   0% */
+    -50,  /*  10% */
+    -38,  /*  20% */
+    -28,  /*  30% */
+    -19,  /*  40% */
+    -11,  /*  50% */
+     -5,  /*  60% */
+      0,  /*  70% */
+     +2,  /*  80% */
+     +4,  /*  90% */
+     +6,  /* 100% */
+};
+
+static int vol_percent_to_alc_gain(int percent)
+{
+    if (percent <= 0) return -64;
+    if (percent >= 100) return (int)s_vol_curve[10];
+    int idx  = percent / 10;
+    int frac = percent % 10;
+    int a = (int)s_vol_curve[idx];
+    int b = (int)s_vol_curve[idx + 1];
+    return a + (b - a) * frac / 10;
+}
 static int cb_get_mute(void)   { return s_mute; }
 
 /* ── 自定义 vol_set：映射 0-100 到 ALC 增益
@@ -582,14 +617,7 @@ static esp_err_t _my_vol_set(void *handle, int volume)
         ESP_LOGW(TAG, "_my_vol_set: s_alc_el is NULL, volume=%d", volume);
         return ESP_ERR_INVALID_STATE;
     }
-    int alc_gain;
-    if (volume <= 0) {
-        alc_gain = -64;
-    } else {
-        int diff = 100 - volume;
-        alc_gain = -(diff * diff * 30) / 10000;
-        if (alc_gain < -64) alc_gain = -64;
-    }
+    int alc_gain = vol_percent_to_alc_gain(volume);
     esp_gmf_alc_set_gain_all(s_alc_el, (int8_t)alc_gain);
     ESP_LOGI(TAG, "vol=%d -> alc_gain=%d", volume, alc_gain);
     return ESP_OK;
@@ -715,6 +743,8 @@ static void reset_miplay_media_locked(void)
     lvgl_port_ui_clear_cover();
     lvgl_port_ui_set_title("DLNA Player");
     lvgl_port_ui_set_artist("Waiting...");
+    /* 字段已清空，后续标题到达时必须补一次歌词抓取 */
+    s_lyrics_refetch_pending = true;
 }
 
 /* 只在 UI 任务中调用；调用者已持有 LVGL 锁。 */
@@ -781,6 +811,8 @@ static void consume_miplay_media_events_locked(void)
             lvgl_port_ui_set_title("DLNA Player");
             lvgl_port_ui_set_artist("Waiting...");
             s_lyrics_ui_clear_pending = false;
+            /* 切歌清空后标题可能要等下一个事件才到，置位保证补抓 */
+            s_lyrics_refetch_pending = true;
         }
 
         if ((event->changed & MIPLAY_MEDIA_CHANGED_ID) && event->id[0]) {
@@ -847,11 +879,22 @@ static void consume_miplay_media_events_locked(void)
             fetch_album_art_async(s_miplay_cover_url);
         }
 
-        if (new_track && s_miplay_title[0]) {
+        /* 只要标题到位就该抓歌词：正常切歌走 new_track，
+         * 中途投屏/字段被重置后靠 s_lyrics_refetch_pending 补触发。 */
+        if (s_miplay_title[0] && (new_track || s_lyrics_refetch_pending)) {
             unsigned long song_id = 0;
             const char *id = s_miplay_id[0] ? s_miplay_id : s_miplay_audio_id;
             if (id[0]) song_id = strtoul(id, NULL, 10);
+            s_lyrics_refetch_pending = false;
             lyrics_fetch_async(s_miplay_title, s_miplay_artist, song_id);
+            if (!new_track) {
+                ESP_LOGW(TAG, "Lyric refetch after reset (mid-playback cast): %.24s - %.16s",
+                         s_miplay_title, s_miplay_artist);
+            }
+        } else if (new_track) {
+            /* new_track 但标题为空 → 等 s_lyrics_refetch_pending 在标题到达时补抓 */
+            ESP_LOGW(TAG, "new_track but title empty, defer lyric fetch "
+                     "(id=%.16s audio_id=%.16s)", s_miplay_id, s_miplay_audio_id);
         }
     }
 }
@@ -899,14 +942,7 @@ static void dlna_on_miplay_media_start(bool start)
 static void on_miplay_vol_changed(uint32_t vol_percent)
 {
     if (!s_miplay_alc_el) return;
-    int alc_gain;
-    if (vol_percent <= 0) {
-        alc_gain = -64;
-    } else {
-        int diff = 100 - (int)vol_percent;
-        alc_gain = -(diff * diff * 30) / 10000;
-        if (alc_gain < -64) alc_gain = -64;
-    }
+    int alc_gain = vol_percent_to_alc_gain((int)vol_percent);
     esp_gmf_alc_set_gain_all(s_miplay_alc_el, (int8_t)alc_gain);
     ESP_LOGI(TAG, "[MiPlay] Vol %lu%% → ALC gain %d", (unsigned long)vol_percent, alc_gain);
 }
@@ -1336,19 +1372,15 @@ static void cb_set_volume(int v)
     _my_vol_set(NULL, s_mute ? 0 : s_vol);
     /* MiPlay 管线有独立 ALC，也要同步 */
     if (s_miplay_alc_el) {
-        int alc_gain;
-        if (v <= 0) {
-            alc_gain = -64;
-        } else {
-            int diff = 100 - v;
-            alc_gain = -(diff * diff * 30) / 10000;
-            if (alc_gain < -64) alc_gain = -64;
-        }
-        esp_gmf_alc_set_gain_all(s_miplay_alc_el, (int8_t)alc_gain);
+        esp_gmf_alc_set_gain_all(s_miplay_alc_el,
+                                 (int8_t)vol_percent_to_alc_gain(v));
     }
+    /* 音量记忆：无论是否投屏都落 NVS。
+     * 以前只在 s_miplay_connected 时存，导致未投屏调的音量重启/下次投屏被
+     * NVS 旧值（手机端上次的值）覆盖。 */
+    miplay_set_volume((uint32_t)v);
     if (s_miplay_connected) {
         /* MiPlay 投屏时本地音量要同步给手机，否则手机端显示的还是旧值 */
-        miplay_set_volume((uint32_t)v);
         s_miplay_pending_volume = v;
     }
 }
@@ -2587,6 +2619,17 @@ static void ui_update_task(void *arg)
         s_last_lyrics_visible = is_lyrics_vis;
 
         const lyric_data_t *lyr = lyrics_get_data();
+        /* 歌词新加载完成（从未加载→已加载）时强制复位行跟踪，
+         * 保证中途投屏后立刻定位到当前进度对应的那一行，
+         * 而不是沿用上一首残留的 last_cur_line 导致跳过首次刷新。 */
+        static bool s_lyr_was_loaded = false;
+        bool lyr_now_loaded = lyr && lyr->loaded && lyr->count > 0;
+        if (lyr_now_loaded && !s_lyr_was_loaded) {
+            last_cur_line = -1;
+            ESP_LOGI("LYRIC", "lyrics (re)loaded, forcing line resync at pos=%dms", pos_ms);
+        }
+        s_lyr_was_loaded = lyr_now_loaded;
+
         if (lyr && lyr->loaded && lyr->count > 0 && is_lyrics_vis) {
             int cur = lyrics_get_current_line(pos_ms);
             if (cur < 0 || cur >= lyr->count) {
@@ -2602,6 +2645,10 @@ static void ui_update_task(void *arg)
 
                 /* 行切换时才更新歌词文本（避免复位滚动位置） */
                 if (cur != last_cur_line) {
+                    int lrc_t = lyr->lines[cur].time_ms;
+                    ESP_LOGI("LYRIC", "line %d->%d pos=%dms lrc_t=%dms diff=%+dms txt=%.20s",
+                             last_cur_line, cur, pos_ms, lrc_t, pos_ms - lrc_t,
+                             lyr->lines[cur].text);
                     last_cur_line = cur;
                     lvgl_port_ui_lyrics_update(cur, prev, curr, next);
                     /* 滚动速率与这句歌词时长相绑定（末句按字数估算，避免滚动停滞） */
@@ -3010,6 +3057,15 @@ void app_main(void)
     esp_err_t miplay_ret = miplay_init();
     if (miplay_ret != ESP_OK) {
         ESP_LOGE(TAG, "miplay_init failed: %s", esp_err_to_name(miplay_ret));
+    }
+    /* 本地音量从 NVS 恢复。必须在 miplay_init() 之后——NVS 是在那里读入
+     * s_volume_percent 的，之前读只会拿到初值 50。 */
+    {
+        uint32_t saved = miplay_get_volume();
+        if (saved <= 100) {
+            s_vol = (int)saved;
+            ESP_LOGI(TAG, "Restored local volume from NVS: %d%%", s_vol);
+        }
     }
     dlna_create_task(ui_update_task, "ui_update",
                      DLNA_UI_UPDATE_STACK_BYTES, NULL, 3, &s_ui_update_task, 0);
