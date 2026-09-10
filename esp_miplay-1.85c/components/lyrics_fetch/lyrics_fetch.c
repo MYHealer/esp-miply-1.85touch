@@ -872,14 +872,15 @@ static void parse_lrc(const char *lrc_text, lyric_data_t *data)
 
 /* ── 解析 klyric/yrc 逐字时间戳 ──
  * klyric 格式: [line_start,dur](offset,dur)word...  （offset 相对前一字末尾）
- * yrc 格式:    [line_start,dur](offset,dur,0)word...  （offset 相对行头 line_start）
- * 两种格式的字时间都是相对量，需加上行起始才是绝对毫秒。
- * （Lyricon 反编译验证：hk.begin 存原始偏移，UI 端 + line.begin = 绝对时间）
+ * yrc 格式:    [line_start,dur](start,dur,flag)word...（start 是绝对毫秒）
+ * 两者靠括号内参数个数区分：3 参 = yrc，2 参 = klyric。
+ * 一旦本曲出现 3 参即锁定为 yrc，后续 2 参一律忽略。
  */
 static void parse_klyric(const char *klyric_text)
 {
     s_klyric_count = 0;
     s_klyric_line_count = 0;
+    bool is_yrc = false;
 
     const char *p = klyric_text;
     while (*p && s_klyric_count < KLYRIC_MAX_WORDS && s_klyric_line_count < LYRIC_MAX_LINES) {
@@ -904,19 +905,19 @@ static void parse_klyric(const char *klyric_text)
                     int a = 0, b = 0, c = 0;
                     int n = sscanf(rp, "(%d,%d,%d)", &a, &b, &c);
                     if (n == 3) {
-                        /* yrc 格式: (offset,dur,flag) — offset 相对行头起始时间！
-                         * 实测网易云 YRC: [15634,4457](240,306,0)谁
-                         *   → 字绝对起始 = 15634 + 240 = 15874ms
-                         * Lyricon 反编译确认: hk.begin = raw_offset（不加 line_start），
-                         * 其 UI 消费端自行加行起始。我们在解析时直接转绝对时间。 */
-                        int abs_start = line_start + a;
-                        int end = abs_start + b;
-                        /* dur<=0 时兜底（保证每个字至少有点时长，karaoke 不会瞬间跳过） */
-                        if (b <= 0) {
-                            b = 1;
-                            end = abs_start + 1;
+                        /* yrc 格式: (start,dur,flag) — start 是绝对毫秒 */
+                        if (!is_yrc) {
+                            is_yrc = true;
+                            word_time = line_start;
                         }
-                        s_klyric_start[s_klyric_count] = abs_start;
+                        /* dur<=0 时兜底（对齐 LyricOn: dur==0 → end-start，
+                         * 保证每个字至少有点时长，karaoke 不会瞬间跳过） */
+                        int end = a + b;
+                        if (b <= 0) {
+                            if (end > a) b = end - a;
+                            else { b = 1; end = a + 1; }
+                        }
+                        s_klyric_start[s_klyric_count] = a;
                         s_klyric_end[s_klyric_count] = end;
                         s_klyric_count++;
                         rp = strchr(rp, ')');
@@ -925,16 +926,19 @@ static void parse_klyric(const char *klyric_text)
                         while (*rp && *rp != '(' && *rp != '\n' && *rp != '\r') rp++;
                     } else if (sscanf(rp, "(%d,%d)", &a, &b) >= 2) {
                         /* klyric 格式: (offset,dur) — offset 相对前一字末尾 */
-                        word_time += a;
-                        int end = word_time + b;
-                        if (b <= 0) {   /* dur<=0 兜底，避免 0 时长字 */
-                            if (end > word_time) b = end - word_time;
-                            else { b = 1; end = word_time + 1; }
+                        if (!is_yrc) {
+                            word_time += a;
+                            int end = word_time + b;
+                            if (b <= 0) {   /* dur<=0 兜底，避免 0 时长字 */
+                                if (end > word_time) b = end - word_time;
+                                else { b = 1; end = word_time + 1; }
+                            }
+                            s_klyric_start[s_klyric_count] = word_time;
+                            s_klyric_end[s_klyric_count] = word_time + b;
+                            s_klyric_count++;
+                            word_time += b;
                         }
-                        s_klyric_start[s_klyric_count] = word_time;
-                        s_klyric_end[s_klyric_count] = word_time + b;
-                        s_klyric_count++;
-                        word_time += b;
+                        /* yrc 中夹杂的 2 参数格式：跳过，不混入绝对时间轴 */
                         rp = strchr(rp, ')');
                         if (!rp) break;
                         rp++;
@@ -951,8 +955,7 @@ static void parse_klyric(const char *klyric_text)
     }
 
     ESP_LOGI(TAG, "Parsed %d klyric words across %d lines (yrc=%s)",
-             s_klyric_count, s_klyric_line_count,
-             s_klyric_count > 0 && s_klyric_start[0] >= s_klyric_line_time[0] ? "yes" : "no");
+             s_klyric_count, s_klyric_line_count, is_yrc ? "yes" : "no");
 }
 
 /* ── 后台获取任务 ── */

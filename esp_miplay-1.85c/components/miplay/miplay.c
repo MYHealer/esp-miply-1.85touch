@@ -138,8 +138,11 @@ static TaskHandle_t s_rtsp_task = NULL;
 static volatile bool s_running = false;
 static int s_listen_sock = -1;
 
-/* 接收缓冲区大小（堆分配，勿再改回栈数组） */
-#define MIPLAY_MAX_FRAME_PAYLOAD (64U * 1024U)
+/* 接收缓冲区大小（堆分配，勿再改回栈��组）。
+ * 64KB 不够：SetMediaInfo 常带封面 base64（WebP 的 UklGR）再加上歌词。
+ * 粤语注音/逐字 yrc 很容易把整帧顶过 64KB；超限后会把歌词/密文里的
+ * '$' 当新帧头，刷屏 Frame too large 并丢掉控制同步。 */
+#define MIPLAY_MAX_FRAME_PAYLOAD (256U * 1024U)
 #define MIPLAY_RX_BUF_LEN (MIPLAY_MAX_FRAME_PAYLOAD + MIPLAY_FRAME_HDR_LEN)
 #define MIPLAY_MEDIA_INFO_BUFFER_SIZE 8192
 
@@ -281,6 +284,11 @@ static uint32_t s_session_count = 0;
 static void miplay_delete_current_task(void);
 /* ── 媒体会话 generation（每次 OPEN 递增，旧 RTSP/media task 自退出）── */
 static volatile uint32_t s_media_generation = 0;
+/* 上次 OPEN 的 RTSP 目标。QQ 音乐切歌会 FIN 媒体口，但控制口还在；
+ * Resume / 完整 SetMediaInfo 需要用这份地址把 RTSP 拉起来。 */
+static EXT_RAM_BSS_ATTR char s_rtsp_host_saved[64];
+static volatile int s_rtsp_port_saved = 0;
+static volatile bool s_media_restart_pending = false;
 
 /* ── 媒体元数据（SetMediaInfo 接收，GetMediaInfo 返回）── */
 static EXT_RAM_BSS_ATTR char s_media_id[64];
@@ -1500,6 +1508,23 @@ static void miplay_media_event_init(miplay_media_event_t *event)
     event->status = -1;
     event->device_state = -1;
     event->player_state = -1;
+}
+/* Pause/Resume/SetPosition 复用同一块 50KB 事件。全量 memset 会拖住 ACK。 */
+static void miplay_media_event_reset_control(miplay_media_event_t *event)
+{
+    if (!event) return;
+    event->changed = 0;
+    event->position_ms = 0;
+    event->duration_ms = 0;
+    event->status = -1;
+    event->device_state = -1;
+    event->player_state = MIPLAY_PLAYER_STATE_UNKNOWN;
+    event->id[0] = '\0';
+    event->audio_id[0] = '\0';
+    event->title[0] = '\0';
+    event->artist[0] = '\0';
+    event->album[0] = '\0';
+    event->cover_url[0] = '\0';
 }
 
 static void *miplay_psram_prefer_alloc(size_t size)
@@ -3738,8 +3763,80 @@ rtsp_cleanup:
     s_image_port = s_multi_port = 0;
     ESP_LOGI(TAG, "[RTSP] Cleanup done");
     miplay_mark_media_session_closed(client_sock, generation, "rtsp cleanup");
+    /* QQ 音乐切歌 FIN 媒体口但控制口还在：标记待重启，等 Resume/SetMediaInfo 拉起 */
+    if (s_connected && s_active_client_sock == client_sock &&
+        s_media_generation == generation &&
+        s_rtsp_host_saved[0] && s_rtsp_port_saved > 0) {
+        s_media_restart_pending = true;
+        ESP_LOGI(TAG, "[RTSP] control still up after cleanup -> wait restart");
+    }
     /* 250ms 错误恢复退避 — 防止快速重连冲击手机端 */
     vTaskDelay(pdMS_TO_TICKS(250));
+}
+
+/* 保存 RTSP 目标并拉起 RTSP 任务。force=true 用于 Resume/SetMediaInfo 重启。 */
+static bool miplay_start_rtsp_session(int client_sock, const char *host, int port,
+                                      bool has_stream_key, const uint8_t *stream_key,
+                                      bool force, const char *reason)
+{
+    if (!host || host[0] == '\0' || port <= 0 || client_sock < 0) return false;
+    if (!force && s_media_session_opened && s_rtsp_task) return false;
+
+    strncpy(s_rtsp_host_saved, host, sizeof(s_rtsp_host_saved) - 1);
+    s_rtsp_host_saved[sizeof(s_rtsp_host_saved) - 1] = '\0';
+    s_rtsp_port_saved = port;
+
+    uint32_t gen = ++s_media_generation;
+    s_media_paused = false;
+    s_media_restart_pending = false;
+    s_media_session_opened = true;
+    ESP_LOGI(TAG, "[RTSP] start %s:%d gen=%lu force=%d (%s)",
+             host, port, (unsigned long)gen, (int)force,
+             reason ? reason : "rtsp");
+
+    rtsp_task_arg_t *rtsp_arg = malloc(sizeof(rtsp_task_arg_t));
+    if (!rtsp_arg) {
+        ESP_LOGW(TAG, "[RTSP] arg alloc failed (%s)", reason ? reason : "rtsp");
+        return false;
+    }
+    strncpy(rtsp_arg->host, host, sizeof(rtsp_arg->host) - 1);
+    rtsp_arg->host[sizeof(rtsp_arg->host) - 1] = 0;
+    rtsp_arg->port = port;
+    rtsp_arg->client_sock = client_sock;
+    rtsp_arg->generation = gen;
+    rtsp_arg->has_stream_key = has_stream_key;
+    if (has_stream_key && stream_key) {
+        memcpy(rtsp_arg->stream_key, stream_key, sizeof(rtsp_arg->stream_key));
+    } else {
+        memset(rtsp_arg->stream_key, 0, sizeof(rtsp_arg->stream_key));
+    }
+    BaseType_t task_ret = miplay_create_task(
+        miplay_rtsp_task_wrapper, "miplay_rtsp",
+        MIPLAY_RTSP_TASK_STACK_BYTES, rtsp_arg, 4,
+        &s_rtsp_task, 1);
+    if (task_ret == pdPASS) {
+        ESP_LOGI(TAG, "[RTSP] Task launched (%s)", reason ? reason : "rtsp");
+        return true;
+    }
+    ESP_LOGW(TAG, "[RTSP] task creation failed (%s)", reason ? reason : "rtsp");
+    free(rtsp_arg);
+    return false;
+}
+
+/* Resume / SetMediaInfo 时若媒体口已断，用保存的地址把 RTSP 拉起来 */
+static bool miplay_try_restart_rtsp(int client_sock, const char *reason)
+{
+    if (s_rtsp_port_saved <= 0 || s_rtsp_host_saved[0] == '\0') return false;
+    if (s_media_session_opened && s_rtsp_task) return false;
+
+    bool has_key = s_has_stream_key;
+    uint8_t key[16];
+    memcpy(key, s_stream_key, sizeof(key));
+    ESP_LOGI(TAG, "[RTSP] try restart (%s) %s:%d pending=%d",
+             reason ? reason : "rtsp", s_rtsp_host_saved, s_rtsp_port_saved,
+             (int)s_media_restart_pending);
+    return miplay_start_rtsp_session(client_sock, s_rtsp_host_saved, s_rtsp_port_saved,
+                                     has_key, key, false, reason);
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -3792,6 +3889,14 @@ static void disconnect_cleanup(miplay_session_t *session)
      * socket. A companion disconnect must not free a buffer that the active
      * RTSP keepalive loop is still using. */
     if (notify_disconnected && s_connected_cb) s_connected_cb(false);
+}
+
+/* 控制帧头校验：歌词/封面/密文里大量 '$'（0x24），后面通常是 ASCII，
+ * 不能当新帧。合法 outer 只有普通(0x00)/Alone(0x04)/Safety(0x14)。 */
+static bool miplay_frame_hdr_plausible(uint8_t outer_type, uint32_t plen)
+{
+    if (plen > MIPLAY_MAX_FRAME_PAYLOAD) return false;
+    return outer_type == 0x00 || outer_type == 0x04 || outer_type == 0x14;
 }
 
 static void handle_client(miplay_session_t *session)
@@ -3927,25 +4032,33 @@ static void handle_client(miplay_session_t *session)
                 int skip = 1;
                 while (skip < buf_used && buf[skip] != MIPLAY_FRAME_MAGIC) skip++;
                 if (skip > 0) {
-                    ESP_LOGW(TAG, "Bad magic, skip %d bytes", skip);
+                    static uint32_t s_bad_magic_logs;
+                    if ((s_bad_magic_logs++ % 64U) == 0U) {
+                        ESP_LOGW(TAG, "Bad magic, skip %d bytes (count=%lu)",
+                                 skip, (unsigned long)s_bad_magic_logs);
+                    }
                     memmove(buf, buf + skip, buf_used - skip);
                     buf_used -= skip;
                 }
                 continue;
             }
-            uint8_t outer_type = buf[1];   /* 帧外型: 0x00 普通 / 0x14 逻辑(Safety) */
+            uint8_t outer_type = buf[1];   /* 帧外型: 0x00 普通 / 0x04 Alone / 0x14 Safety */
             uint16_t cmd = ((uint16_t)buf[1] << 8) | buf[2];
             uint16_t seq = ((uint16_t)buf[3] << 8) | buf[4];
             uint32_t plen = ((uint32_t)buf[5]<<24)|((uint32_t)buf[6]<<16)|
                             ((uint32_t)buf[7]<<8)|buf[8];
             uint32_t total = MIPLAY_FRAME_HDR_LEN + plen;
 
-            if (plen > MIPLAY_MAX_FRAME_PAYLOAD) {
-                ESP_LOGW(TAG, "Frame too large (%lu), skip to next magic", (unsigned long)plen);
-                int skip = 1;
-                while (skip < buf_used && buf[skip] != MIPLAY_FRAME_MAGIC) skip++;
-                memmove(buf, buf + skip, buf_used - skip);
-                buf_used -= skip;
+            if (!miplay_frame_hdr_plausible(outer_type, plen)) {
+                /* 假 magic 或超大 payload：只跳 1 字节，下一轮再校验 outer/plen。
+                 * 不能在超大 payload 里把每个 '$' 都当新帧头，否则会刷屏并彻底失步。 */
+                static uint32_t s_bad_hdr_logs;
+                if ((s_bad_hdr_logs++ % 64U) == 0U) {
+                    ESP_LOGW(TAG, "Implausible frame hdr outer=0x%02X plen=%lu, skip 1 (count=%lu)",
+                             outer_type, (unsigned long)plen, (unsigned long)s_bad_hdr_logs);
+                }
+                memmove(buf, buf + 1, buf_used - 1);
+                buf_used -= 1;
                 continue;
             }
             if (buf_used < (int)total) break;  /* 等待更多数据 */
@@ -4158,37 +4271,16 @@ static void handle_client(miplay_session_t *session)
                     }
                     /* 启动 RTSP 独立任务；每个会话独占 PSRAM 栈。 */
                     if (rtsp_port > 0) {
-                        /* 递增 generation → 旧 RTSP/media task 下次读时自退出 */
-                        uint32_t gen = ++s_media_generation;
-                        s_media_paused = false;
-                        ESP_LOGI(TAG, "[RTSP] media_generation -> %lu", (unsigned long)gen);
-                        rtsp_task_arg_t *rtsp_arg = malloc(sizeof(rtsp_task_arg_t));
-                        if (rtsp_arg) {
-                            strncpy(rtsp_arg->host, rtsp_host, sizeof(rtsp_arg->host) - 1);
-                            rtsp_arg->host[sizeof(rtsp_arg->host) - 1] = 0;
-                            rtsp_arg->port = rtsp_port;
-                            rtsp_arg->client_sock = client_sock;
-                            rtsp_arg->generation = gen;
-                            rtsp_arg->has_stream_key = open_has_stream_key;
-                            memcpy(rtsp_arg->stream_key, open_stream_key,
-                                   sizeof(rtsp_arg->stream_key));
-                            BaseType_t task_ret = miplay_create_task(
-                                miplay_rtsp_task_wrapper, "miplay_rtsp",
-                                MIPLAY_RTSP_TASK_STACK_BYTES, rtsp_arg, 4,
-                                &s_rtsp_task, 1);
-                            if (task_ret == pdPASS) {
-                                ESP_LOGI(TAG, "[RTSP] Task launched (private PSRAM stack), ctrl loop continues");
-                                break;  /* 退出 OPEN case，继续控制循环处理心跳 */
-                            } else {
-                                ESP_LOGW(TAG, "[RTSP] task creation failed");
-                                free(rtsp_arg);
-                            }
-                        } else {
-                            ESP_LOGW(TAG, "[RTSP] arg alloc failed");
-                            free(rtsp_arg);
+                        /* 保存 RTSP 目标（QQ 切歌后可据此重启）+ 递增 generation
+                         * → 旧 RTSP/media task 下次读时自退出 */
+                        if (miplay_start_rtsp_session(client_sock, rtsp_host, rtsp_port,
+                                                      open_has_stream_key, open_stream_key,
+                                                      true, "OPEN")) {
+                            break;  /* 退出 OPEN case，继续控制循环处理心跳 */
                         }
                         /* fallback: inline 运行（仅在任务创建失败时） */
                         ESP_LOGW(TAG, "[RTSP] Inline fallback");
+                        uint32_t gen = s_media_generation;
                         miplay_rtsp_run(rtsp_host, rtsp_port, client_sock, gen,
                                         open_has_stream_key, open_stream_key);
                         /* RTSP 结束后直接退出 handler（socket 已断开） */
@@ -4545,7 +4637,7 @@ static void handle_client(miplay_session_t *session)
                 /* ── Pause (0x0004) / Resume (0x0006) / SetPosition (0x0056) ── */
                 if (cmd == CMD_PAUSE || cmd == CMD_RESUME || cmd == CMD_SET_POSITION) {
                     int64_t rewind_from_ms = -1;
-                    miplay_media_event_init(event);
+                    miplay_media_event_reset_control(event);
                     if (cmd == CMD_PAUSE) {
                         miplay_set_audio_paused(true, "pause command");
                         event->player_state = MIPLAY_PLAYER_STATE_PAUSED;
@@ -4554,6 +4646,10 @@ static void handle_client(miplay_session_t *session)
                         miplay_set_audio_paused(false, "resume command");
                         event->player_state = MIPLAY_PLAYER_STATE_PLAYING;
                         event->changed = MIPLAY_MEDIA_CHANGED_PLAYER_STATE;
+                        /* QQ 音乐切歌 FIN 了媒体口：控制口 Resume 时把 RTSP 拉回来 */
+                        if (s_media_restart_pending) {
+                            miplay_try_restart_rtsp(client_sock, "resume");
+                        }
                     } else if (plen >= 8) {
                         event->position_ms = (int64_t)opack_u64_be(payload);
                         event->changed = MIPLAY_MEDIA_CHANGED_POSITION;
@@ -4564,8 +4660,13 @@ static void handle_client(miplay_session_t *session)
                         miplay_apply_playback_control(event);
                         miplay_emit_media_event(event);
                     }
-                    ESP_LOGI(TAG, "Media control cmd=0x%04X seq=%u pos=%lld state=%d",
-                             cmd, seq, (long long)event->position_ms, event->player_state);
+                    if (cmd == CMD_SET_POSITION) {
+                        ESP_LOGD(TAG, "Media control cmd=0x%04X seq=%u pos=%lld state=%d",
+                                 cmd, seq, (long long)event->position_ms, event->player_state);
+                    } else {
+                        ESP_LOGI(TAG, "Media control cmd=0x%04X seq=%u pos=%lld state=%d",
+                                 cmd, seq, (long long)event->position_ms, event->player_state);
+                    }
                     send_encrypted_cmd(client_sock, cmd + 1, seq, NULL, 0);
                     if (cmd == CMD_SET_POSITION) {
                         miplay_maybe_query_media_info_on_rewind(
@@ -4643,8 +4744,22 @@ static void handle_client(miplay_session_t *session)
                         ESP_LOGW(TAG, "[MEDIA-INFO] no cover in SetMediaInfo (no UklGR, len=%u)",
                                  (unsigned)plen);
                     }
-                    if (parsed) miplay_emit_media_event(event);
+                    if (parsed) {
+                        /* QQ 切歌会先推带歌名的 stub，mDeviceState=0。
+                         * 这不是真停播：真停走 Pause，或控制口也断开。 */
+                        if (event->title[0] &&
+                            (event->changed & MIPLAY_MEDIA_CHANGED_PLAYER_STATE) &&
+                            event->player_state == MIPLAY_PLAYER_STATE_STOPPED) {
+                            event->changed &= ~(MIPLAY_MEDIA_CHANGED_PLAYER_STATE |
+                                                MIPLAY_MEDIA_CHANGED_DEVICE_STATE |
+                                                MIPLAY_MEDIA_CHANGED_STATUS);
+                            ESP_LOGI(TAG, "[MEDIA-INFO] ignore stub STOPPED (title present)");
+                        }
+                        if (event->changed) miplay_emit_media_event(event);
+                    }
                     send_encrypted_cmd(client_sock, CMD_SET_MEDIA_INFO_ACK, seq, NULL, 0);
+                    /* QQ 音乐切歌后常在 SetMediaInfo 里带新 RTSP 地址，此时媒体口已断 */
+                    miplay_try_restart_rtsp(client_sock, "SetMediaInfo");
                     break;
 #if 0
                     ESP_LOGI(TAG, "[MEDIA-INFO] SetMediaInfo seq=%u payload=%.*s",

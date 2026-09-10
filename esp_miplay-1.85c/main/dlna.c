@@ -2292,7 +2292,9 @@ static void audio_player_init(void)
     /* ── 7. 设置管线事件回调 ── */
     esp_gmf_pipeline_set_event(s_pipe, pipeline_event_cb, NULL);
 
-    /* ── 8. 起手音量 ── */
+    /* ── 8. 起手音量（从 NVS 加载持久化音量） ── */
+    s_vol = (int)lvgl_port_ui_load_volume_from_nvs();
+    s_last_applied_vol = s_vol;
     _my_vol_set(NULL, s_vol);
 
     ESP_LOGI(TAG, "GMF audio pipeline ready (io_http → aud_dec → aud_alc → ch_cvt → bit_cvt → io_codec_dev)");
@@ -3057,15 +3059,6 @@ void app_main(void)
     esp_err_t miplay_ret = miplay_init();
     if (miplay_ret != ESP_OK) {
         ESP_LOGE(TAG, "miplay_init failed: %s", esp_err_to_name(miplay_ret));
-    }
-    /* 本地音量从 NVS 恢复。必须在 miplay_init() 之后——NVS 是在那里读入
-     * s_volume_percent 的，之前读只会拿到初值 50。 */
-    {
-        uint32_t saved = miplay_get_volume();
-        if (saved <= 100) {
-            s_vol = (int)saved;
-            ESP_LOGI(TAG, "Restored local volume from NVS: %d%%", s_vol);
-        }
     }
     dlna_create_task(ui_update_task, "ui_update",
                      DLNA_UI_UPDATE_STACK_BYTES, NULL, 3, &s_ui_update_task, 0);

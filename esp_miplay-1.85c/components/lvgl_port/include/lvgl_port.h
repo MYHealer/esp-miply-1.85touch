@@ -57,6 +57,8 @@ void lvgl_port_ui_set_artist(const char *artist);
 void lvgl_port_ui_set_progress(int position_sec, int duration_sec);
 void lvgl_port_ui_set_state(int state);  /* 0=停止 1=播放 2=暂停 */
 void lvgl_port_ui_set_volume(int vol);
+/* 从 NVS 读取上次保存的音量（0-100）；无记录时返回默认 35 */
+uint8_t lvgl_port_ui_load_volume_from_nvs(void);
 void lvgl_port_ui_lyrics_update(int current_idx, const char *prev, const char *curr, const char *next);
 void lvgl_port_ui_lyrics_karaoke(int byte_idx);
 void lvgl_port_ui_lyrics_scroll_to_end(int line_duration_ms);

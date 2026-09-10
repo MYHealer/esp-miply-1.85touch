@@ -276,6 +276,10 @@ static int s_lyrics_current = -1;
 static int s_lyrics_prev_line = -1;        /* 上一次的行号，用于检测切换动画 */
 static bool s_lyrics_visible = false;
 static bool s_cover_ready = false;         /* 封面图片已加载就绪 */
+/* ── 待机时钟：非播放态无触摸超时进入 ── */
+#define STANDBY_IDLE_MS 120000U            /* 2 分钟 */
+static uint32_t s_last_touch_tick = 0;     /* 上次触摸时刻（lv_tick） */
+static bool s_playing_state = false;       /* 由 lvgl_port_ui_set_state 维护 */
 static lv_obj_t *s_lyrics_bg_img = NULL; /* 歌词界面背景图 */
 /* 背景渐变（预抖动图片，消除 RGB565 色阶） */
 static lv_obj_t *s_bg_img = NULL;        /* 背景图片控件 */
@@ -327,6 +331,7 @@ static lv_obj_t *s_capsule_slider;        /* 滑块 */
 static lv_obj_t *s_capsule_backdrop;      /* 半透明遮罩 */
 static lv_timer_t *s_capsule_hide_timer;  /* 自动隐藏定时器 */
 static lv_timer_t *s_brightness_save_timer; /* NVS 防抖 */
+static lv_timer_t *s_volume_save_timer;     /* NVS 防抖（音量） */
 static capsule_popup_type_t s_capsule_type = CAPSULE_POPUP_VOLUME;
 static int s_capsule_current_value;       /* 当前值 0-100 */
 static bool s_capsule_visible;
@@ -340,6 +345,7 @@ static capsule_value_cb_t s_capsule_brightness_cb = NULL;
 
 /* NVS 句柄 */
 static nvs_handle_t s_nvs_brightness = 0;
+static nvs_handle_t s_nvs_volume = 0;
 static lv_obj_t *s_status_sram_bar;
 static lv_obj_t *s_status_psram_bar;
 static lv_obj_t *s_wlan_scr;
@@ -986,6 +992,58 @@ static void _brightness_debounced_save(uint8_t val)
             _brightness_save_timer_cb, BRIGHTNESS_SAVE_MS, NULL);
         lv_timer_set_repeat_count(s_brightness_save_timer, 1);
     }
+}
+
+/* ── 音量 NVS 持久化 ──
+ * 与亮度同款：命名空间 "display"，防抖 500ms 落盘。
+ * 直接在 LVGL 定时器里写 flash 是安全的——timer 跑在 lvgl 任务（内部 RAM 栈），
+ * 不存在从 PSRAM 栈调用 nvs_commit 的断言问题。 */
+static void _save_volume_to_nvs(uint8_t val)
+{
+    if (!s_nvs_volume) {
+        if (nvs_open("display", NVS_READWRITE, &s_nvs_volume) != ESP_OK) {
+            ESP_LOGW(TAG, "NVS open volume failed");
+            return;
+        }
+    }
+    nvs_set_u8(s_nvs_volume, "volume", val);
+    nvs_commit(s_nvs_volume);
+    ESP_LOGI(TAG, "Volume %d saved to NVS", val);
+}
+
+static void _volume_save_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    _save_volume_to_nvs((uint8_t)s_volume_current);
+    if (s_volume_save_timer) {
+        lv_timer_del(s_volume_save_timer);
+        s_volume_save_timer = NULL;
+    }
+}
+
+static void _volume_debounced_save(int val)
+{
+    if (s_volume_save_timer) {
+        lv_timer_reset(s_volume_save_timer);
+    } else {
+        s_volume_save_timer = lv_timer_create(
+            _volume_save_timer_cb, 500, NULL);
+        lv_timer_set_repeat_count(s_volume_save_timer, 1);
+    }
+}
+
+uint8_t lvgl_port_ui_load_volume_from_nvs(void)
+{
+    nvs_handle_t h = 0;
+    uint8_t val = 35;   /* 无记录时默认 35%，比 50% 更接近正常听音音量 */
+    if (nvs_open("display", NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_u8(h, "volume", &val) == ESP_OK) {
+            ESP_LOGI(TAG, "Loaded volume %u from NVS", (unsigned)val);
+        }
+        nvs_close(h);
+    }
+    if (val > 100) val = 100;
+    return val;
 }
 
 static void _capsule_opa_anim_cb(void *obj, int32_t value)
@@ -2113,6 +2171,19 @@ static void _gesture_timer_cb(lv_timer_t *timer)
     int y = 0;
     if (!lvgl_port_touch_get_snapshot(&pressed, &x, &y)) return;
 
+    /* ── 待机时钟：非播放态连续无触摸 STANDBY_IDLE_MS 后进入 ── */
+    if (pressed) {
+        s_last_touch_tick = lv_tick_get();
+    } else if (lv_scr_act() != s_standby_scr && !s_playing_state &&
+               s_last_touch_tick != 0 &&
+               (lv_tick_get() - s_last_touch_tick) > STANDBY_IDLE_MS) {
+        _show_standby_screen();
+    }
+    if (pressed && lv_scr_act() == s_standby_scr) {
+        /* 待机屏任意触摸唤醒（LVGL CLICKED 可能因手势滑动不触发） */
+        _show_parent_screen();
+    }
+
     if (pressed && !s_gesture.active) {
         s_gesture.start_x = x;
         s_gesture.start_y = y;
@@ -2429,6 +2500,7 @@ void lvgl_port_ui_create(void)
     _create_wlan_password_screen();
     _create_standby_screen();
     _create_system_ui();
+    s_last_touch_tick = lv_tick_get();   /* 待机空闲计时起点 */
     s_gesture_timer = lv_timer_create(_gesture_timer_cb, 20, NULL);
     s_wifi_status_timer = lv_timer_create(_wifi_status_timer_cb, 1000, NULL);
     _update_system_status();
@@ -2656,6 +2728,9 @@ static void _animate_citou(int target_angle)
 void lvgl_port_ui_set_state(int state) {
     if (state == s_last_ui_state) return;  /* 状态没变，跳过 */
     s_last_ui_state = state;
+    /* 播放/暂停时不计入待机空闲（暂停算"在用"，仅停止才息屏） */
+    s_playing_state = (state != 0);
+    s_last_touch_tick = lv_tick_get();
 
     /* 如果开始播放，退出息屏时钟页面 */
     if (state == 1) {
@@ -2693,7 +2768,12 @@ void lvgl_port_ui_set_volume(int vol)
 {
     if (vol < 0) vol = 0;
     if (vol > 100) vol = 100;
+    bool changed = (vol != s_volume_current);
     s_volume_current = vol;
+    /* 音量变化防抖落 NVS（500ms），避免拖动滑块时反复擦写 flash */
+    if (changed) {
+        _volume_debounced_save(vol);
+    }
     /* 胶囊弹窗正在显示音量时同步滑块 */
     if (s_capsule_visible && s_capsule_type == CAPSULE_POPUP_VOLUME && s_capsule_slider) {
         lv_slider_set_value(s_capsule_slider, vol, LV_ANIM_OFF);
