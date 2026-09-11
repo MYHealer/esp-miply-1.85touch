@@ -2785,6 +2785,15 @@ void lvgl_port_ui_set_volume(int vol)
     }
 }
 
+void lvgl_port_ui_show_volume_popup(int vol)
+{
+    /* 可以在任意 FreeRTOS task 线程安全调用（airkan 遥控网路 task 等）。
+     * LVGL 操作必须持锁，否则与渲染线程数据竞争 → 卡死/WDT/断连。 */
+    lvgl_port_lock();
+    _show_capsule_popup(CAPSULE_POPUP_VOLUME, vol);
+    lvgl_port_unlock();
+}
+
 /* Interleaved gradient noise → [0, mod). Better than Bayer for slow ramps. */
 static unsigned _ign(int x, int y, unsigned mod)
 {

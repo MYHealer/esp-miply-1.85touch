@@ -28,6 +28,7 @@
 #include "mbedtls/sha256.h"
 #include "mbedtls/aes.h"
 #include "esp_random.h"
+#include "lvgl_port.h"
 #include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -5233,81 +5234,136 @@ static void airkan_rc_client_task(void *arg)
     setsockopt(cs, IPPROTO_TCP, TCP_NODELAY, &(int){1}, sizeof(int));
 
     bool version_done = false;
-    uint8_t buf[AIRKAN_RC_BUF_SZ];
+    /* 累积缓冲区：TCP 是字节流，心跳(3B)和版本包(89B)可能粘在一个 recv。
+     * 若不累积，后到的版本包会被覆盖丢失。 */
+    uint8_t rbuf[AIRKAN_RC_BUF_SZ];
+    int rlen = 0;
+    int64_t last_beat = esp_timer_get_time() / 1000;  /* ms */
 
     while (s_running) {
-        int n = recv(cs, buf, sizeof(buf), 0);
-        if (n < 3) {
+        /* 设备主动喂心跳：手机看门狗只需"收到任何数据"即保活(-302 otherwise)。
+         * select 每 4000ms 醒一次发心跳，即使手机不发任何东西也能保活。
+         * 心跳= {2,0,0}，正是 j2.c.f24858a 手机自身用的同款。 */
+        int64_t now = esp_timer_get_time() / 1000;
+        if (now - last_beat >= 4000) {
+            uint8_t hb[3] = {0x02, 0x00, 0x00};
+            if (send(cs, hb, 3, 0) < 0) {
+                ESP_LOGI(TAG, "airkan-rc:%d beat send fail, end", lport);
+                break;
+            }
+            last_beat = now;
+        }
+
+        /* select 100ms 超时，兼顾读数据和喂心跳 */
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(cs, &rfds);
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 };
+        int sel = select(cs + 1, &rfds, NULL, NULL, &tv);
+        if (sel < 0) break;
+        if (sel == 0) continue;  /* 超时，回循环顶部喂心跳 */
+
+        if (rlen >= (int)sizeof(rbuf)) { rlen = 0; }
+        int n = recv(cs, rbuf + rlen, sizeof(rbuf) - rlen, 0);
+        if (n <= 0) {
             ESP_LOGI(TAG, "airkan-rc:%d recv done (n=%d errno=%d)", lport, n, errno);
             break;
         }
-        uint8_t  type = buf[0];
-        uint16_t len  = (buf[1] << 8) | buf[2];
-        ESP_LOGI(TAG, "airkan-rc:%d RX type=%d len=%u n=%d", lport, type, len, n);
+        rlen += n;
 
-        if (type == 5 && !version_done) {
-            uint32_t phone_ver = 0;
-            if (n >= 8)
-                phone_ver = ((uint32_t)buf[4] << 24) | (buf[5] << 16) |
-                            (buf[6] << 8) | buf[7];
-            ESP_LOGI(TAG, "airkan-rc:%d VERSION ver=0x%08lX (no reply)",
-                     lport, (unsigned long)phone_ver);
-            version_done = true;
+        /* 逐条解析累积缓冲中完整的消息 */
+        while (rlen >= 3) {
+            uint8_t  type  = rbuf[0];
+            uint16_t mlen  = (rbuf[1] << 8) | rbuf[2];
+            int      need  = 3 + mlen;
+            if (need > (int)sizeof(rbuf)) {  /* 长度异常，清空防错位 */
+                ESP_LOGW(TAG, "airkan-rc:%d bad len=%u, flushing", lport, mlen);
+                rlen = 0;
+                break;
+            }
+            if (rlen < need) break;  /* 消息不完整，等更多数据 */
 
-        } else if (type == 2) {
-            /* 心跳: 不回复。手机有时心跳先于版本包到达，
-             * 在版本握手前回 ACK 可能导致手机协议错乱。 */
-            ESP_LOGI(TAG, "airkan-rc:%d HEARTBEAT (no reply)", lport);
+            if (type == 5 && !version_done) {
+                uint32_t phone_ver = 0;
+                if (need >= 8)
+                    phone_ver = ((uint32_t)rbuf[4] << 24) | (rbuf[5] << 16) |
+                                (rbuf[6] << 8) | rbuf[7];
+                ESP_LOGI(TAG, "airkan-rc:%d VERSION ver=0x%08lX, reply 0x%08lX",
+                         lport, (unsigned long)phone_ver,
+                         (unsigned long)AIRKAN_REPORT_VERSION);
+                /* code=2 响应。之前发 code=1 会让 l2.d.a() 按请求解析 → null */
+                uint8_t ver_resp[9] = {
+                    0x05, 0x00, 0x06, 0x02, 0x01,
+                    (uint8_t)(AIRKAN_REPORT_VERSION >> 24),
+                    (uint8_t)(AIRKAN_REPORT_VERSION >> 16),
+                    (uint8_t)(AIRKAN_REPORT_VERSION >> 8),
+                    (uint8_t)(AIRKAN_REPORT_VERSION),
+                };
+                send(cs, ver_resp, sizeof(ver_resp), 0);
+                version_done = true;
+                ESP_LOGI(TAG, "airkan-rc:%d VERSION sent (9B code=2)", lport);
 
-        } else if (type == 4 && n >= 10) {
-            uint8_t  code   = buf[3];
-            uint32_t seq_id = ((uint32_t)buf[4] << 24) | (buf[5] << 16) |
-                              (buf[6] << 8) | buf[7];
-            uint16_t data_len = (buf[8] << 8) | buf[9];
-            ESP_LOGI(TAG, "airkan-rc:%d key code=%d id=%lu dlen=%u",
-                     lport, code, (unsigned long)seq_id, data_len);
+            } else if (type == 2) {
+                /* 手机的心跳。我们不单独 echo —— 已在循环顶部主动喂心跳。
+                 * 这里只记录，避免和主动心跳重复发。 */
+                ESP_LOGI(TAG, "airkan-rc:%d phone HEARTBEAT", lport);
 
-            int off = 10;
-            int key_code = -1, action = -1;
-            while (off + 5 <= n && off < 10 + (int)data_len) {
-                uint8_t sc = buf[off];
-                int v = (int)((uint32_t)buf[off+1] << 24 | buf[off+2] << 16 |
-                              buf[off+3] << 8 | buf[off+4]);
-                if (sc == 2) action = v;
-                if (sc == 3) key_code = v;
-                off += (sc == 7 || sc == 8) ? 9 : 5;
+            } else if (type == 4 && need >= 10) {
+                uint8_t  code   = rbuf[3];
+                uint32_t seq_id = ((uint32_t)rbuf[4] << 24) | (rbuf[5] << 16) |
+                                  (rbuf[6] << 8) | rbuf[7];
+                uint16_t data_len = (rbuf[8] << 8) | rbuf[9];
+                ESP_LOGI(TAG, "airkan-rc:%d key code=%d id=%lu dlen=%u",
+                         lport, code, (unsigned long)seq_id, data_len);
+
+                int off = 10;
+                int key_code = -1, action = -1;
+                while (off + 5 <= need && off < 10 + (int)data_len) {
+                    uint8_t sc = rbuf[off];
+                    int v = (int)((uint32_t)rbuf[off+1] << 24 | rbuf[off+2] << 16 |
+                                  rbuf[off+3] << 8 | rbuf[off+4]);
+                    if (sc == 2) action = v;
+                    if (sc == 3) key_code = v;
+                    off += (sc == 7 || sc == 8) ? 9 : 5;
+                }
+
+                if (code == 1 && key_code >= 0 && action == 0) {
+                    const char *ctrl = NULL;
+                    switch (key_code) {
+                        case 24:
+                            miplay_set_volume(miplay_get_volume() + 5);
+                            ESP_LOGI(TAG, "airkan: VOL+ → %lu",
+                                     (unsigned long)miplay_get_volume());
+                            lvgl_port_ui_show_volume_popup(miplay_get_volume());
+                            break;
+                        case 25:
+                            miplay_set_volume(miplay_get_volume() > 5
+                                              ? miplay_get_volume() - 5 : 0);
+                            ESP_LOGI(TAG, "airkan: VOL- → %lu",
+                                     (unsigned long)miplay_get_volume());
+                            lvgl_port_ui_show_volume_popup(miplay_get_volume());
+                            break;
+                        case 19: ctrl = "next";  break;
+                        case 20: ctrl = "prev";  break;
+                        case 23:
+                        case 26: ctrl = "pause"; break;
+                        default:
+                            ESP_LOGW(TAG, "airkan: unhandled keyCode=%d", key_code);
+                            break;
+                    }
+                    if (ctrl) {
+                        ESP_LOGI(TAG, "airkan: key %d → %s", key_code, ctrl);
+                        miplay_send_receiver_control(ctrl, 0);
+                    }
+                }
+
+            } else {
+                ESP_LOGW(TAG, "airkan-rc:%d unknown type=%d len=%u", lport, type, mlen);
             }
 
-            if (code == 1 && key_code >= 0 && action == 0) {
-                const char *ctrl = NULL;
-                switch (key_code) {
-                    case 24:
-                        miplay_set_volume(miplay_get_volume() + 5);
-                        ESP_LOGI(TAG, "airkan: VOL+ → %lu",
-                                 (unsigned long)miplay_get_volume());
-                        break;
-                    case 25:
-                        miplay_set_volume(miplay_get_volume() > 5
-                                          ? miplay_get_volume() - 5 : 0);
-                        ESP_LOGI(TAG, "airkan: VOL- → %lu",
-                                 (unsigned long)miplay_get_volume());
-                        break;
-                    case 19: ctrl = "next";  break;
-                    case 20: ctrl = "prev";  break;
-                    case 23:
-                    case 26: ctrl = "pause"; break;
-                    default:
-                        ESP_LOGW(TAG, "airkan: unhandled keyCode=%d", key_code);
-                        break;
-                }
-                if (ctrl) {
-                    ESP_LOGI(TAG, "airkan: key %d → %s", key_code, ctrl);
-                    miplay_send_receiver_control(ctrl, 0);
-                }
-            }
-
-        } else {
-            ESP_LOGW(TAG, "airkan-rc:%d unknown type=%d len=%u", lport, type, len);
+            /* 消费已处理消息，剩余数据前移 */
+            rlen -= need;
+            if (rlen > 0) memmove(rbuf, rbuf + need, rlen);
         }
     }
     close(cs);
