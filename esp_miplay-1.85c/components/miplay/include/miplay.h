@@ -98,6 +98,12 @@ bool miplay_is_connected(void);
 uint32_t miplay_get_volume(void);
 
 /**
+ * @brief 获取当前播放进度 (ms)
+ * 手机上报的最新位置镜像，供 airkan 遥控左右键 seek 计算用。
+ */
+uint64_t miplay_get_position_ms(void);
+
+/**
  * @brief 设置本地 MiPlay 音量百分比 (0-100)
  *
  * 立即作用于 s_volume_percent 并写入 NVS，后续 GET_VOLUME 会读到新值。

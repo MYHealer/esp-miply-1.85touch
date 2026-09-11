@@ -2608,6 +2608,11 @@ static void ui_update_task(void *arg)
         if (s_vol != s_last_applied_vol) {
             int hw = s_mute ? 0 : s_vol;
             _my_vol_set(NULL, hw);
+            /* MiPlay 管线有独立 ALC，也要同步（airkan 遥控调音量也走这条） */
+            if (s_miplay_alc_el) {
+                esp_gmf_alc_set_gain_all(s_miplay_alc_el,
+                                         (int8_t)vol_percent_to_alc_gain(s_vol));
+            }
             s_last_applied_vol = s_vol;
         }
         lvgl_port_ui_set_volume(s_vol);

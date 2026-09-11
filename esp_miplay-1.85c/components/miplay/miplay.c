@@ -5326,9 +5326,14 @@ static void airkan_rc_client_task(void *arg)
                     if (sc == 3) key_code = v;
                     off += (sc == 7 || sc == 8) ? 9 : 5;
                 }
+                if (key_code < 0) {
+                    ESP_LOGW(TAG, "airkan-rc:%d parse FAIL ctrl=0x%02X act=%d",
+                             lport, code, action);
+                }
 
                 if (code == 1 && key_code >= 0 && action == 0) {
                     const char *ctrl = NULL;
+                    bool control_ok = false;
                     switch (key_code) {
                         case 24:
                             miplay_set_volume(miplay_get_volume() + 5);
@@ -5345,8 +5350,25 @@ static void airkan_rc_client_task(void *arg)
                             break;
                         case 19: ctrl = "next";  break;
                         case 20: ctrl = "prev";  break;
-                        case 23:
-                        case 26: ctrl = "pause"; break;
+                        case 21: {  /* LEFT → 进度 -15s */
+                            uint64_t pos = miplay_get_position_ms();
+                            int64_t target = pos > 15000 ? (int64_t)(pos - 15000) : 0;
+                            ESP_LOGI(TAG, "airkan: LEFT → seek %lldms (was %llums)",
+                                     (long long)target, (unsigned long long)pos);
+                            miplay_send_receiver_control("seek", target);
+                            break;
+                        }
+                        case 22: {  /* RIGHT → 进度 +15s */
+                            uint64_t pos = miplay_get_position_ms();
+                            int64_t target = (int64_t)(pos + 15000);
+                            ESP_LOGI(TAG, "airkan: RIGHT → seek %lldms (was %llums)",
+                                     (long long)target, (unsigned long long)pos);
+                            miplay_send_receiver_control("seek", target);
+                            break;
+                        }
+                        case 23:   /* KEYCODE_DPAD_CENTER 兼容 */
+                        case 66:   /* KEYCODE_ENTER —— 小米妙享遥控中间确认键实际发送 */
+                        case 26: control_ok = true; break;  /* 由下方 toggle 处理 */
                         default:
                             ESP_LOGW(TAG, "airkan: unhandled keyCode=%d", key_code);
                             break;
@@ -5354,6 +5376,21 @@ static void airkan_rc_client_task(void *arg)
                     if (ctrl) {
                         ESP_LOGI(TAG, "airkan: key %d → %s", key_code, ctrl);
                         miplay_send_receiver_control(ctrl, 0);
+                    } else if (control_ok) {
+                        /* OK 键 toggle：本地静态记忆上次动作，交替 pause/play。
+                         * 消抖：手机按下会连发多帧 action=0，300ms 内只处理一次。 */
+                        static bool ok_is_playing = true;
+                        static int64_t ok_last_ms = -1;
+                        int64_t now_ms = esp_timer_get_time() / 1000;
+                        if (ok_last_ms >= 0 && now_ms - ok_last_ms < 300) {
+                            ESP_LOGI(TAG, "airkan: OK debounced (skip)");
+                        } else {
+                            const char *action = ok_is_playing ? "pause" : "play";
+                            ok_is_playing = !ok_is_playing;
+                            ESP_LOGI(TAG, "airkan: OK → %s", action);
+                            miplay_send_receiver_control(action, 0);
+                        }
+                        ok_last_ms = now_ms;
                     }
                 }
 
@@ -5755,6 +5792,13 @@ bool miplay_is_connected(void)
 uint32_t miplay_get_volume(void)
 {
     return s_volume_percent;
+}
+
+/* ── 获取当前播放进度 (ms) ──
+ * 供 airkan 遥控左右键 seek 使用。s_media_position 是手机上报的最新位置镜像。 */
+uint64_t miplay_get_position_ms(void)
+{
+    return s_media_position;
 }
 
 /* ── 本地设置 MiPlay 音量百分比（0-100）──
