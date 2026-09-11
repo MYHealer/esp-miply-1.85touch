@@ -492,13 +492,28 @@ static uint32_t get_my_ipv4(void)
     return 0x7F000001UL;
 }
 
+/* 每行 16 字节：左侧 hex，右侧可打印 ASCII（其余显示 '.'）。
+ * 用于看清明文 payload 里的 JSON / 字符串，而不只是密文乱码。
+ * 上限 256B，足够覆盖遥控按键的完整 JSON。 */
 static void dump_hex(const uint8_t *data, int len, const char *label)
 {
-    char hex[160];
-    int h = 0;
-    for (int i = 0; i < len && i < 48; i++)
-        h += snprintf(hex + h, sizeof(hex) - h, "%02X ", data[i]);
-    ESP_LOGI(TAG, "[%s] %dB: %s", label, len, hex);
+    const int cap = 256;
+    int n = len < cap ? len : cap;
+    ESP_LOGI(TAG, "[%s] %dB%s", label, len,
+             len > cap ? " (truncated to 256)" : "");
+    for (int off = 0; off < n; off += 16) {
+        char hex[3 * 16 + 1];
+        char asc[16 + 1];
+        int h = 0, a = 0;
+        for (int i = 0; i < 16 && off + i < n; i++) {
+            uint8_t c = data[off + i];
+            h += snprintf(hex + h, sizeof(hex) - h, "%02X ", c);
+            asc[a++] = (c >= 0x20 && c < 0x7F) ? (char)c : '.';
+        }
+        hex[h] = '\0';
+        asc[a] = '\0';
+        ESP_LOGI(TAG, "  %04X  %-48s |%s|", off, hex, asc);
+    }
 }
 
 /* ── 设备身份标识 ── */
@@ -2577,7 +2592,11 @@ static int build_device_info_payload(uint8_t *out, size_t out_max)
      * body 在堆上构建（避免大栈数组）。 */
     struct { const char *key; const char *val; } fields[] = {
         {"alonePlayCapacity", "0"},
-        {"canAlonePlayCtrl", "0"},
+        /* canAlonePlayCtrl=1：向手机申报"本机可被遥控控制"。
+         * 原值 0（从 PC 原型抄来的默认值）会让遥控器面板不下发任何按键，
+         * 表现为"遥控器界面能点但音箱没反应"。
+         * canRevCtrl=1 是反方向（音箱→手机），两条互不影响。 */
+        {"canAlonePlayCtrl", "1"},
         {"canHeadsetCtrl", "0"},
         {"canRevCtrl", "1"},
         {"channel", ""},
@@ -4024,6 +4043,10 @@ static void handle_client(miplay_session_t *session)
         }
         buf_used += n;
 
+        /* 原始字节 dump：遥控按键的帧格式尚未确认，可能是标准 9 字节头，
+         * 也可能完全不同的自定义格式。先看裸字节，避免解析层把它当垃圾丢掉。 */
+        if (n <= 96) dump_hex((const uint8_t *)(buf + buf_used - n), n, "RAW");
+
         /* 处理完整帧 */
         while (buf_used >= MIPLAY_FRAME_HDR_LEN) {
             /* 解析9字节大端序头 */
@@ -4094,6 +4117,10 @@ static void handle_client(miplay_session_t *session)
                         was_encrypted = true;
                         payload = dec_buf;
                         plen = (uint32_t)dec_len;
+                        /* 明文 dump：遥控按键多为短 JSON（如 {"keyCode":82}），
+                         * 只看密文 hex 无法判断内容，这里必须打解密后的。 */
+                        if (plen > 0 && plen <= 256)
+                            dump_hex(payload, (int)plen, "plain");
                     } else {
                         ESP_LOGW(TAG, "Unified decrypt failed for cmd=0x%04X", cmd);
                         heap_caps_free(dec_buf); dec_buf = NULL;
@@ -4144,7 +4171,12 @@ static void handle_client(miplay_session_t *session)
                     send_encrypted_cmd(client_sock, cmd + 1, seq, NULL, 0);
                     break;
                 default:
-                    ESP_LOGW(TAG, "AloneMedia unknown sub=0x%02X seq=%u", sub_cmd, seq);
+                    /* 遥控器按键疑似落点（Alone 命名空间私有子命令）。
+                     * 全量 dump 明文，按键 payload 可能是 JSON 或二进制。 */
+                    ESP_LOGW(TAG, "AloneMedia unknown sub=0x%02X seq=%u plen=%lu",
+                             sub_cmd, seq, (unsigned long)plen);
+                    if (payload && plen > 0)
+                        dump_hex(payload, (int)plen, "AloneMedia");
                     break;
                 }
                 goto frame_done;
@@ -4490,9 +4522,46 @@ static void handle_client(miplay_session_t *session)
                     break;
                 }
 
-                /* ── SetLocalDeviceInfo (0x0058) ── */
+                /* ── SetLocalDeviceInfo (0x0058) ──
+                 * 手机用这条下发它自己的信息 + 对音箱的开关要求：
+                 *   {"sourceName":"REDMI K80 Ultra", ...}  手机型号
+                 *   {"isSameAccount":0}                    账号状态（不阻断本地遥控）
+                 *   {"canAlonePlayCtrl":"1"}               要求开启遥控控制能力
+                 * 之前整条 payload 被丢弃，手机收不到"能力已开启"的确认，
+                 * 会反复重发 canAlonePlayCtrl（实测一次会话内 7 次），
+                 * 遥控器始终停在协商阶段，不下发任何按键命令。 */
                 if (cmd == CMD_SET_LOCAL_DEV_INFO) {
                     ESP_LOGI(TAG, "SetLocalDeviceInfo seq=%u len=%lu", seq, (unsigned long)plen);
+                    if (cmd == CMD_SET_LOCAL_DEV_INFO && payload && plen > 0) {
+                        /* payload 是 JSON 明文，直接搜字段即可（避免引入解析器开销） */
+                        if (memmem(payload, plen, "\"canAlonePlayCtrl\"", 18) &&
+                            memmem(payload, plen, "\"1\"", 3)) {
+                            ESP_LOGI(TAG, "Phone requested canAlonePlayCtrl=1 → confirm capability");
+                            /* 重发能力通知，把"我可被控"明确告知手机 */
+                            {
+                                uint8_t mode_body[] = {4, 'm', 'o', 'd', 'e', 3, 2};
+                                miplay_send_cmd(client_sock, CMD_NOTIFY, 5,
+                                                mode_body, sizeof(mode_body));
+                            }
+                            {
+                                uint8_t mi_body[MIPLAY_MEDIA_INFO_BUFFER_SIZE];
+                                int mi_len = miplay_build_media_info_ex(mi_body, sizeof(mi_body));
+                                if (mi_len > 0)
+                                    miplay_send_cmd(client_sock, CMD_NOTIFY, 6, mi_body, mi_len);
+                            }
+                            {
+                                uint8_t state_body[] = {5, 's', 't', 'a', 't', 'e', 3, 0};
+                                miplay_send_cmd(client_sock, CMD_NOTIFY, 7,
+                                                state_body, sizeof(state_body));
+                            }
+                            ESP_LOGI(TAG, "-> NOTIFY capabilities resent (AlonePlayCtrl)");
+                        }
+                        char json_preview[96];
+                        int pn = (plen < 95) ? (int)plen : 95;
+                        memcpy(json_preview, payload, pn);
+                        json_preview[pn] = '\0';
+                        ESP_LOGI(TAG, "  LocalDevInfo: %.95s", json_preview);
+                    }
                     if (s_has_session_key) {
                         send_encrypted_cmd(client_sock, CMD_SET_LOCAL_DEV_ACK, seq, NULL, 0);
                     } else {
@@ -4837,8 +4906,10 @@ static void handle_client(miplay_session_t *session)
                     break;
                 }
 
-                ESP_LOGW(TAG, "Unhandled cmd=0x%04X seq=%u len=%lu",
-                         cmd, seq, (unsigned long)plen);
+                ESP_LOGW(TAG, "Unhandled cmd=0x%04X seq=%u len=%lu outer=0x%02X",
+                         cmd, seq, (unsigned long)plen, outer_type);
+                if (payload && plen > 0)
+                    dump_hex(payload, (int)plen, "Unhandled");
                 break;
             }
             } /* switch */
@@ -4866,6 +4937,383 @@ static BaseType_t miplay_create_task(TaskFunction_t task, const char *name,
                                      uint32_t stack_bytes, void *arg,
                                      UBaseType_t priority, TaskHandle_t *handle,
                                      BaseType_t core);
+
+/* ── airkan 遥控探针 ──
+ *
+ * 逆向确认：小米"设备互联"的 TV 遥控器有两条通道，Lyra（需 LYRA_ID）和
+ * airkan（杜坎 airkan_sdk）。我们的设备被识别为 TV、遥控面板可打开，但
+ * TCP 8899 上零按键帧，故怀疑按键走 airkan 的独立通道。
+ *
+ * airkan 已知监听 6095（HttpTask 硬编码），认证入口是 HTTP：
+ *   GET /requestAuth?device_id=<id>&version_code=1
+ *   GET /completeAuth?<rsa>
+ *   GET /cancelAuth?device_id=<id>
+ * 认证成功后另开 TCP 长连接，帧结构（已从 o2.c/o2.j/o2.i 完整还原）：
+ *   [RCHeader 3B: type=4|7, len BE16][SendKeyHeader 7B: code|id BE32|len BE16]
+ *   [SendKeyData: TLV, subcode 2=action 3=keyCode ...]
+ *
+ * 本探针实现 airkan 的 HTTP 认证段（getInfo/cancelAuth/requestAuth/completeAuth），
+ * 并多开若干候选端口探测手机按键走哪条 TCP 长连。airkan 的连接失败是静默的
+ * （不重试、不报错），所以必须靠日志判断走到哪一步。
+ */
+
+/* 上报的 airkan 协议版本。
+ * 手机侧 remote/i.onVersionResponse 判定：version > 0x01000000 才视为"支持遥控"。
+ * 实测报 1 时手机只反复 /getInfo（每次按键重探），永不推进 → 说明低版本被当成
+ * "设备不支持"。报 0x01000008 后手机立刻走 cancelAuth→getInfo→requestAuth。
+ * 加密（若随之启用）留到确认链路能走通后再实现。 */
+#define AIRKAN_REPORT_VERSION 0x01000008
+
+/* airkan 的两个端口（角色不同，别混）：
+ *   6095 = HTTP 认证口（HttpTask 硬编码，getInfo/requestAuth/completeAuth）
+ *   6091 = TCP 遥控长连口（按键帧走这里）
+ * 6091 来自 HyperAll 逆向结论 + 反编译验证：
+ *   AirkanService.java:1010 `P(new f(this, h.IP, str), 2)`
+ *   → :1272 构造函数 `f(AirkanService a, h hVar, String str) { this(hVar, 6091, str, false, false); }`
+ *   → :420 `this.A.f(fVar.f6142d, fVar.f6141c)`  (ip, port)
+ *   → remote/i.java:76 `f(String ip, int port)` → RCClientThreadV2.connect
+ *   → RCClientThreadV2.java:341 `socketChannel.connect(new InetSocketAddress(mIp, mPort))`
+ * 之前猜的 6094-6100 全部避开了 6091，所以按键永远收不到。
+ * 保留 6095 (HTTP) + 6091 (TCP)，另留 6090/6092 兜底。 */
+static const uint16_t s_airkan_ports[] = { 6095, 6091, 6090, 6092 };
+#define AIRKAN_PORT_COUNT (sizeof(s_airkan_ports) / sizeof(s_airkan_ports[0]))
+
+/* 应答一个最小 HTTP/1.1 JSON 响应。失败只记日志，不中断服务。 */
+static void airkan_send_json(int cs, const char *json)
+{
+    char resp[512];
+    int body_len = (int)strlen(json);
+    int n = snprintf(resp, sizeof(resp),
+                     "HTTP/1.1 200 OK\r\n"
+                     "Content-Type: application/json; charset=utf-8\r\n"
+                     "Content-Length: %d\r\n"
+                     "Connection: close\r\n"
+                     "\r\n"
+                     "%s",
+                     body_len, json);
+    if (n > 0) {
+        int sent = send(cs, resp, n, 0);
+        ESP_LOGI(TAG, "airkan: HTTP 200 sent=%d/%d body=%s", sent, n, json);
+    }
+}
+
+/* 从 query 串中取 name= 的值（到 & 或串尾为止），找不到返回 false。
+ * airkan 的请求都是 GET，参数在 URL 里，不需要完整的 URL 解码。
+ * 注意：请求行末尾是 " HTTP/1.1"，所以空格也必须当终止符——
+ * 否则最后一个参数会把 " HTTP/1.1" 一起吃进去。 */
+static bool airkan_query_value(const char *query, const char *name, char *out, size_t out_sz)
+{
+    size_t nlen = strlen(name);
+    const char *p = query;
+    while ((p = strstr(p, name)) != NULL) {
+        /* 要求前面是 ? 或 & ，避免匹配到别的前缀 */
+        if (p == query || p[-1] == '?' || p[-1] == '&') {
+            if (p[nlen] == '=') {
+                const char *v = p + nlen + 1;
+                const char *end = v;
+                while (*end && *end != '&' && *end != ' ' && *end != '\r' && *end != '\n')
+                    end++;
+                size_t vlen = (size_t)(end - v);
+                if (vlen >= out_sz) vlen = out_sz - 1;
+                memcpy(out, v, vlen);
+                out[vlen] = '\0';
+                return true;
+            }
+        }
+        p += nlen;
+    }
+    return false;
+}
+
+/* 上报给手机的 tv_id。认证成功后 airkan 用它派生 CBC 密钥
+ * (tv_id + "cbcKey_Key"/"cbcKey_Iv")，所以必须稳定不变。 */
+static const char *airkan_tv_id(void)
+{
+    static char s_tv_id[40];
+    if (s_tv_id[0] == '\0') {
+        uint8_t mac[6] = {0};
+        esp_read_mac(mac, ESP_MAC_WIFI_STA);
+        snprintf(s_tv_id, sizeof(s_tv_id), "esp32tv%02x%02x%02x%02x%02x%02x",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+    return s_tv_id;
+}
+
+static void airkan_rc_client_task(void *arg);  /* forward declaration */
+
+static void airkan_probe_task(void *arg)
+{
+    (void)arg;
+
+   /* 多端口监听：index 0 是 HTTP 口(6095)，其余是 TCP 遥控候选口。
+     * 用一张 fd_set 统一 select，任一端口有连接就 accept 并记录端口号，
+     * 这样一次固件就能确定手机到底连哪个。 */
+    int ls[AIRKAN_PORT_COUNT];
+    int nls = 0;
+    for (size_t i = 0; i < AIRKAN_PORT_COUNT; i++) {
+        struct sockaddr_in a = {
+            .sin_family = AF_INET,
+            .sin_port = htons(s_airkan_ports[i]),
+            .sin_addr.s_addr = htonl(INADDR_ANY),
+        };
+        int s = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+        if (s < 0) continue;
+        int opt = 1;
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        if (bind(s, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(s, 4) < 0) {
+            ESP_LOGW(TAG, "airkan: port %u unavailable (errno=%d)",
+                     (unsigned)s_airkan_ports[i], errno);
+            close(s);
+            continue;
+        }
+        ls[nls++] = s;
+    }
+    if (nls == 0) {
+        ESP_LOGE(TAG, "airkan: no port could be bound, probe disabled");
+        miplay_delete_current_task();
+        return;
+    }
+    ESP_LOGI(TAG, "airkan probe: %d ports listening (ver=%d tv_id=%s)",
+             nls, AIRKAN_REPORT_VERSION, airkan_tv_id());
+
+    while (s_running) {
+        struct sockaddr_in cli;
+        socklen_t cl = sizeof(cli);
+        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        int maxfd = -1;
+        for (int i = 0; i < nls; i++) {
+            FD_SET(ls[i], &rfds);
+            if (ls[i] > maxfd) maxfd = ls[i];
+        }
+        if (select(maxfd + 1, &rfds, NULL, NULL, &tv) <= 0) continue;
+
+        for (int i = 0; i < nls; i++) {
+            if (!FD_ISSET(ls[i], &rfds)) continue;
+            int cs = accept(ls[i], (struct sockaddr *)&cli, &cl);
+            if (cs < 0) continue;
+
+            /* 找出该 socket 对应的端口号，日志里带上便于确定候选口 */
+            int lport = 0;
+            {
+                struct sockaddr_in la;
+                socklen_t lal = sizeof(la);
+                if (getsockname(ls[i], (struct sockaddr *)&la, &lal) == 0)
+                    lport = ntohs(la.sin_port);
+            }
+            ESP_LOGW(TAG, "airkan: CONNECT on port %d from %s:%u",
+                     lport, inet_ntoa(cli.sin_addr), (unsigned)ntohs(cli.sin_port));
+
+            /* 非 6095 = TCP 遥控口：直接把 socket 交给 RC task，
+             * 不在这里 recv——否则版本包被 probe 消耗，RC task 收不到。 */
+            if (lport != 6095) {
+                ESP_LOGI(TAG, "airkan: port %d spawning RC task", lport);
+                TaskHandle_t h = NULL;
+                if (miplay_create_task(airkan_rc_client_task, "airkan_rc",
+                                       4096, (void *)(intptr_t)cs,
+                                       5, &h, 1) != pdPASS) {
+                    ESP_LOGE(TAG, "airkan: failed to create RC task");
+                    close(cs);
+                }
+                continue;
+            }
+
+            struct timeval rtv = { .tv_sec = 3, .tv_usec = 0 };
+            setsockopt(cs, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+            char rx[768];
+            int n = recv(cs, rx, sizeof(rx) - 1, 0);
+            if (n <= 0) {
+                ESP_LOGW(TAG, "airkan: port %d no data (n=%d errno=%d)", lport, n, errno);
+                close(cs);
+                continue;
+            }
+            rx[n] = '\0';
+
+        /* 首行 "METHOD /path?query HTTP/1.1"。path 与 query 都要保留：
+         * getInfo 靠 query 的 action 区分，requestAuth 靠 query 取 device_id。 */
+        char path[384] = {0};
+        {
+            char *nl = strchr(rx, '\n');
+            int len = nl ? (int)(nl - rx) : n;
+            if (len >= (int)sizeof(path)) len = sizeof(path) - 1;
+            memcpy(path, rx, len);
+            path[len] = '\0';
+            while (len > 0 && (path[len - 1] == '\r' || path[len - 1] == ' '))
+                path[--len] = '\0';
+        }
+        ESP_LOGW(TAG, "airkan: port %d got %d bytes | %s", lport, n, path);
+
+        char json[384];
+        if (strstr(path, "/getInfo") && strstr(path, "getVersion")) {
+            /* 版本探测：必须 200 + JSON，否则手机会当成"设备不支持"并反复重探。
+             * 实测报 1 时手机不推进；报 > 0x01000000 才继续到 requestAuth。 */
+            snprintf(json, sizeof(json),
+                     "{\"status\":0,\"msg\":\"ok\",\"data\":{\"version\":%d}}",
+                     AIRKAN_REPORT_VERSION);
+            airkan_send_json(cs, json);
+        } else if (strstr(path, "/requestAuth")) {
+            /* 返回设备信息 + 可选公钥。public_key 留空 → 手机走"无加密"分支
+             * (AirkanHttpClient.a.a: TextUtils.isEmpty(public_key) → onSuccess)。
+             * device_id 必须原样回显手机自己的，否则校验失败报 90004。 */
+            char dev_id[64] = {0};
+            char ver_code[16] = {0};
+            if (!airkan_query_value(path, "device_id", dev_id, sizeof(dev_id))) {
+                strcpy(dev_id, "");
+            }
+            if (!airkan_query_value(path, "version_code", ver_code, sizeof(ver_code))) {
+                strcpy(ver_code, "1");
+            }
+            snprintf(json, sizeof(json),
+                     "{\"code\":60000,\"msg\":\"ok\",\"resp_data\":{"
+                     "\"device_id\":\"%s\","
+                     "\"tv_id\":\"%s\","
+                     "\"public_key\":\"\","
+                     "\"verify_code_additional\":\"\","
+                     "\"versionCode\":\"%s\"}}",
+                     dev_id, airkan_tv_id(), ver_code);
+            airkan_send_json(cs, json);
+        } else if (strstr(path, "/cancelAuth")) {
+            /* 会话清理：{"code":60000} 即视为成功 */
+            airkan_send_json(cs, "{\"code\":60000,\"msg\":\"ok\"}");
+        } else if (strstr(path, "/completeAuth")) {
+            /* 明文模式下手机不会走到这里（requestAuth 已 onSuccess）。
+             * 若真的来了，回 tv_id 让它继续。 */
+            snprintf(json, sizeof(json),
+                     "{\"code\":60000,\"msg\":\"ok\",\"resp_data\":{\"tv_id\":\"%s\"}}",
+                     airkan_tv_id());
+            airkan_send_json(cs, json);
+        } else {
+            ESP_LOGW(TAG, "airkan: unhandled request, replying 404");
+            const char *nf = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            send(cs, nf, strlen(nf), 0);
+        }
+        close(cs);
+    }
+    }   /* while (s_running) */
+    for (int i = 0; i < nls; i++) close(ls[i]);
+    miplay_delete_current_task();
+}
+
+/* ── airkan TCP 遥控长连处理器 ──
+ *
+ * 手机认证成功后连 6091，发版本协商包，然后持续发按键帧 + 心跳。
+ * 本 task 处理单个连接的完整生命周期：
+ *   1. 接收版本包 (RCHeader type=5) → 回版本响应
+ *   2. 定时发心跳 {0x02, 0x00, 0x00}（每 10 秒）
+ *   3. 接收按键帧 (RCHeader type=4) → 解析 TLV → 映射到播放控制
+ *
+ * 帧格式（完整还原自 o2.c/o2.j/o2.i）：
+ *   [type:1B][len:2B BE] ← RCHeader
+ *   [code:1B][id:4B BE][data_len:2B BE] ← SendKeyHeader
+ *   [subcode:1B][value:4B or 8B]... ← TLV
+ * TLV subcode: 2=action(0=down,1=up), 3=keyCode
+ */
+#define AIRKAN_RC_BUF_SZ  256
+#define AIRKAN_HEARTBEAT_INTERVAL_S  10
+
+/* 前向声明：miplay_get_volume / miplay_set_volume / miplay_send_receiver_control
+ * 定义在本文件后部（~5570），此处声明以供 airkan_rc_client_task 调用。 */
+extern uint32_t miplay_get_volume(void);
+extern void miplay_set_volume(uint32_t percent);
+extern void miplay_send_receiver_control(const char *action, int64_t value);
+
+static void airkan_rc_client_task(void *arg)
+{
+    int cs = (int)(intptr_t)arg;
+    struct sockaddr_in la;
+    socklen_t lal = sizeof(la);
+    int lport = 0;
+    if (getsockname(cs, (struct sockaddr *)&la, &lal) == 0)
+        lport = ntohs(la.sin_port);
+    ESP_LOGI(TAG, "airkan-rc:%d handler started", lport);
+
+    struct timeval rtv = { .tv_sec = 20, .tv_usec = 0 };
+    setsockopt(cs, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+    setsockopt(cs, IPPROTO_TCP, TCP_NODELAY, &(int){1}, sizeof(int));
+
+    bool version_done = false;
+    uint8_t buf[AIRKAN_RC_BUF_SZ];
+
+    while (s_running) {
+        int n = recv(cs, buf, sizeof(buf), 0);
+        if (n < 3) {
+            ESP_LOGI(TAG, "airkan-rc:%d recv done (n=%d errno=%d)", lport, n, errno);
+            break;
+        }
+        uint8_t  type = buf[0];
+        uint16_t len  = (buf[1] << 8) | buf[2];
+        ESP_LOGI(TAG, "airkan-rc:%d RX type=%d len=%u n=%d", lport, type, len, n);
+
+        if (type == 5 && !version_done) {
+            uint32_t phone_ver = 0;
+            if (n >= 8)
+                phone_ver = ((uint32_t)buf[4] << 24) | (buf[5] << 16) |
+                            (buf[6] << 8) | buf[7];
+            ESP_LOGI(TAG, "airkan-rc:%d VERSION ver=0x%08lX (no reply)",
+                     lport, (unsigned long)phone_ver);
+            version_done = true;
+
+        } else if (type == 2) {
+            /* 心跳: 不回复。手机有时心跳先于版本包到达，
+             * 在版本握手前回 ACK 可能导致手机协议错乱。 */
+            ESP_LOGI(TAG, "airkan-rc:%d HEARTBEAT (no reply)", lport);
+
+        } else if (type == 4 && n >= 10) {
+            uint8_t  code   = buf[3];
+            uint32_t seq_id = ((uint32_t)buf[4] << 24) | (buf[5] << 16) |
+                              (buf[6] << 8) | buf[7];
+            uint16_t data_len = (buf[8] << 8) | buf[9];
+            ESP_LOGI(TAG, "airkan-rc:%d key code=%d id=%lu dlen=%u",
+                     lport, code, (unsigned long)seq_id, data_len);
+
+            int off = 10;
+            int key_code = -1, action = -1;
+            while (off + 5 <= n && off < 10 + (int)data_len) {
+                uint8_t sc = buf[off];
+                int v = (int)((uint32_t)buf[off+1] << 24 | buf[off+2] << 16 |
+                              buf[off+3] << 8 | buf[off+4]);
+                if (sc == 2) action = v;
+                if (sc == 3) key_code = v;
+                off += (sc == 7 || sc == 8) ? 9 : 5;
+            }
+
+            if (code == 1 && key_code >= 0 && action == 0) {
+                const char *ctrl = NULL;
+                switch (key_code) {
+                    case 24:
+                        miplay_set_volume(miplay_get_volume() + 5);
+                        ESP_LOGI(TAG, "airkan: VOL+ → %lu",
+                                 (unsigned long)miplay_get_volume());
+                        break;
+                    case 25:
+                        miplay_set_volume(miplay_get_volume() > 5
+                                          ? miplay_get_volume() - 5 : 0);
+                        ESP_LOGI(TAG, "airkan: VOL- → %lu",
+                                 (unsigned long)miplay_get_volume());
+                        break;
+                    case 19: ctrl = "next";  break;
+                    case 20: ctrl = "prev";  break;
+                    case 23:
+                    case 26: ctrl = "pause"; break;
+                    default:
+                        ESP_LOGW(TAG, "airkan: unhandled keyCode=%d", key_code);
+                        break;
+                }
+                if (ctrl) {
+                    ESP_LOGI(TAG, "airkan: key %d → %s", key_code, ctrl);
+                    miplay_send_receiver_control(ctrl, 0);
+                }
+            }
+
+        } else {
+            ESP_LOGW(TAG, "airkan-rc:%d unknown type=%d len=%u", lport, type, len);
+        }
+    }
+    close(cs);
+    ESP_LOGI(TAG, "airkan-rc:%d task ended", lport);
+    miplay_delete_current_task();
+}
 
 static void miplay_client_task(void *arg)
 {
@@ -5431,6 +5879,9 @@ esp_err_t miplay_init(void)
         ESP_LOGE(TAG, "MiPlay LAN discovery task unavailable (UDP %d)",
                  MIPLAY_LAN_DISCOVERY_PORT);
     }
+    /* airkan 遥控探针（临时，观测手机是否连 6095） */
+    TaskHandle_t probe_h = NULL;
+    miplay_create_task(airkan_probe_task, "airkan_probe", 5120, NULL, 3, &probe_h, 0);
     BaseType_t announce_ret = miplay_create_task(mdns_announce_task, "mdns_ann",
                                                  MIPLAY_ANNOUNCE_TASK_STACK_BYTES,
                                                  NULL, 3, &s_announce_task, 0);
