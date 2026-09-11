@@ -58,6 +58,14 @@ void lvgl_port_ui_set_progress(int position_sec, int duration_sec);
 void lvgl_port_ui_set_state(int state);  /* 0=停止 1=播放 2=暂停 */
 void lvgl_port_ui_set_volume(int vol);
 void lvgl_port_ui_show_volume_popup(int vol);
+/* 进入休眠屏保（供 airkan 遥控关机键等调用） */
+void lvgl_port_ui_enter_standby(void);
+/* 退出休眠屏保，回到之前界面 */
+void lvgl_port_ui_exit_standby(void);
+/* 当前是否处于休眠屏保界面 */
+bool lvgl_port_ui_is_standby(void);
+/* 重置待机空闲计时（供 airkan 遥控按键调用） */
+void lvgl_port_ui_reset_idle(void);
 /* 从 NVS 读取上次保存的音量（0-100）；无记录时返回默认 35 */
 uint8_t lvgl_port_ui_load_volume_from_nvs(void);
 void lvgl_port_ui_lyrics_update(int current_idx, const char *prev, const char *curr, const char *next);

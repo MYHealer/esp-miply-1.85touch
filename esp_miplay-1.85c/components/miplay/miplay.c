@@ -5334,6 +5334,7 @@ static void airkan_rc_client_task(void *arg)
                 if (code == 1 && key_code >= 0 && action == 0) {
                     const char *ctrl = NULL;
                     bool control_ok = false;
+                    bool control_power = false;
                     switch (key_code) {
                         case 24:
                             miplay_set_volume(miplay_get_volume() + 5);
@@ -5368,11 +5369,14 @@ static void airkan_rc_client_task(void *arg)
                         }
                         case 23:   /* KEYCODE_DPAD_CENTER 兼容 */
                         case 66:   /* KEYCODE_ENTER —— 小米妙享遥控中间确认键实际发送 */
-                        case 26: control_ok = true; break;  /* 由下方 toggle 处理 */
+                        control_ok = true; break;  /* 由下方 toggle 处理 */
+                            case 26: control_power = true; break;  /* KEYCODE_POWER 关机键 → 进入屏保 */
                         default:
                             ESP_LOGW(TAG, "airkan: unhandled keyCode=%d", key_code);
                             break;
                     }
+                    /* 遥控按键算作"用户在用"，重置待机空闲计时 */
+                    lvgl_port_ui_reset_idle();
                     if (ctrl) {
                         ESP_LOGI(TAG, "airkan: key %d → %s", key_code, ctrl);
                         miplay_send_receiver_control(ctrl, 0);
@@ -5391,6 +5395,15 @@ static void airkan_rc_client_task(void *arg)
                             miplay_send_receiver_control(action, 0);
                         }
                         ok_last_ms = now_ms;
+                    } else if (control_power) {
+                        /* 关机键(POWER=26) toggle：屏保 ↔ 正常界面 */
+                        if (lvgl_port_ui_is_standby()) {
+                            ESP_LOGI(TAG, "airkan: POWER → wake");
+                            lvgl_port_ui_exit_standby();
+                        } else {
+                            ESP_LOGI(TAG, "airkan: POWER → standby");
+                            lvgl_port_ui_enter_standby();
+                        }
                     }
                 }
 

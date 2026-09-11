@@ -2375,6 +2375,12 @@ static void miplay_pipeline_start(void)
     while ((item = xRingbufferReceive(s_ts_ringbuf, &dummy, 0)) != NULL) {
         vRingbufferReturnItem(s_ts_ringbuf, item);
     }
+    /* 先完整 stop 一次：触发 LOADING_JOB ACTION_STOP → 各元素 process_close →
+     * 解码器 dec_hd 真正复位。否则 esp_gmf_pipeline_reset 只复位状态位/job_mask，
+     * 不解码器内部状态（PTS/ADTS对齐/consumed 残留）→ 重连后从旧字节边界解码 → 卡顿。
+     * 快速重连时旧 media task 被 generation 替换会跳过 miplay.c 的 stop 回调，
+     * 必须在这里兜底复位。GMF task 作业队列保证 close(TIMES_ONCE) 先于后续 open。 */
+    esp_gmf_pipeline_stop(s_miplay_pipe);
     /* 重连后元素状态残留 STOPPED，必须 reset 回 INITIALIZED 才能 loading_jobs */
     esp_gmf_pipeline_reset(s_miplay_pipe);
     esp_gmf_err_t r1 = esp_gmf_pipeline_loading_jobs(s_miplay_pipe);

@@ -277,7 +277,7 @@ static int s_lyrics_prev_line = -1;        /* 上一次的行号，用于检测�
 static bool s_lyrics_visible = false;
 static bool s_cover_ready = false;         /* 封面图片已加载就绪 */
 /* ── 待机时钟：非播放态无触摸超时进入 ── */
-#define STANDBY_IDLE_MS 120000U            /* 2 分钟 */
+#define STANDBY_IDLE_MS 300000U            /* 5 分钟无操作进入休眠屏保 */
 static uint32_t s_last_touch_tick = 0;     /* 上次触摸时刻（lv_tick） */
 static bool s_playing_state = false;       /* 由 lvgl_port_ui_set_state 维护 */
 static lv_obj_t *s_lyrics_bg_img = NULL; /* 歌词界面背景图 */
@@ -2286,15 +2286,16 @@ static void _wifi_status_timer_cb(lv_timer_t *timer)
     /* 息屏时钟页面显示时，保持每秒更新时间 */
     if (lv_scr_act() == s_standby_scr) {
         _update_standby_time();
-    } else {
-        /* 如果没有在播放音乐（s_last_ui_state != 1），且两分钟（120秒）无人操作，则进入息屏显示 */
-        if (s_last_ui_state != 1) {
-            uint32_t inactive_ms = lv_display_get_inactive_time(NULL);
-            if (inactive_ms >= 120000) {
-                ESP_LOGI(TAG, "Inactive time reached %u ms, entering standby clock", (unsigned)inactive_ms);
-                _show_standby_screen();
-            }
-        }
+    } else if (lv_scr_act() != s_standby_scr && !s_playing_state &&
+               s_last_touch_tick != 0 &&
+               (lv_tick_get() - s_last_touch_tick) > STANDBY_IDLE_MS) {
+        /* 非播放态且连续无触摸/遥控操作 STANDBY_IDLE_MS 后进入待机。
+         * 统一用 s_last_touch_tick（触摸 + set_state + 遥控都会刷新它），
+         * 不用 lv_display_get_inactive_time（只靠 LVGL 输入重置，遥控器操作
+         * 不产生触摸事件会导致误判进入待机）。 */
+        ESP_LOGI(TAG, "Inactive time reached %u ms, entering standby clock",
+                 (unsigned)STANDBY_IDLE_MS);
+        _show_standby_screen();
     }
 }
 
@@ -2787,10 +2788,44 @@ void lvgl_port_ui_set_volume(int vol)
 
 void lvgl_port_ui_show_volume_popup(int vol)
 {
-    /* 可以在任意 FreeRTOS task 线程安全调用（airkan 遥控网路 task 等）。
-     * LVGL 操作必须持锁，否则与渲染线程数据竞争 → 卡死/WDT/断连。 */
     lvgl_port_lock();
-    _show_capsule_popup(CAPSULE_POPUP_VOLUME, vol);
+    /* 屏保界面不弹音量胶囊，避免打扰待机时钟 */
+    if (lv_scr_act() != s_standby_scr) {
+        _show_capsule_popup(CAPSULE_POPUP_VOLUME, vol);
+    }
+    lvgl_port_unlock();
+}
+
+/* 进入休眠屏保（供 airkan 遥控关机键等调用）。持锁线程安全。 */
+void lvgl_port_ui_enter_standby(void)
+{
+    lvgl_port_lock();
+    _show_standby_screen();
+    lvgl_port_unlock();
+}
+
+/* 退出休眠屏保，回到之前的界面（供关机键再按唤醒）。若不在屏保则无操作。 */
+void lvgl_port_ui_exit_standby(void)
+{
+    lvgl_port_lock();
+    if (lv_scr_act() == s_standby_scr) {
+        _show_parent_screen();
+    }
+    lvgl_port_unlock();
+}
+
+/* 当前是否处于休眠屏保界面 */
+bool lvgl_port_ui_is_standby(void)
+{
+    return lv_scr_act() == s_standby_scr;
+}
+
+/* 重置待机空闲计时（供 airkan 遥控按键调用）。
+ * 遥控操作不产生触摸事件，但应算作"用户在用"，避免误入待机屏。 */
+void lvgl_port_ui_reset_idle(void)
+{
+    lvgl_port_lock();
+    s_last_touch_tick = lv_tick_get();
     lvgl_port_unlock();
 }
 
