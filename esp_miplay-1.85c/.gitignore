@@ -101,6 +101,7 @@ temp_extract_*/
 docs/reference/
 
 # Coredump files
-coredump_new.bin
-coredump_new.elf
-coredump_post_font.bin
+# Coredump 崩溃转储与解析产物 (含内存快照, 体积大且属临时调试产物)
+coredump*.bin
+coredump*.elf
+read_coredump.ps1
