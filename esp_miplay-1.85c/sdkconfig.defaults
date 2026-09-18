@@ -15,15 +15,19 @@ CONFIG_SPIRAM=y
 CONFIG_SPIRAM_BOOT_INIT=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_SPEED_80M=y
-# PSRAM 栈 + SPI Flash 共用 cache 总线：PSRAM 栈的 task 做 flash 操作时
-# spi_flash_disable_interrupts_caches_and_other_cpu() 关 cache → PSRAM 不可访问
-# → esp_task_stack_is_sane_cache_disabled() 断言崩溃。禁用 PSRAM 栈规避。
-# CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY is not set
+# ★ 对齐 esp_miplay-Miaoban_fork：启用 PSRAM 栈。
+#   实测内部 SRAM 只剩 ~94KB（int_free=95891），而 PSRAM 有 6MB 闲置；
+#   任务栈是内部 RAM 最大占用方，放回 PSRAM 才能把内部 RAM 留给
+#   DMA 描述符 / ISR / WiFi 控制块等"必须内部"的分配。
+#   注意：要避免在 PSRAM 栈任务里直接做 flash 写（NVS/OTA）；
+#   确有需要时用 dlna_create_task 的 PSRAM 优先 + 内部回退策略。
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
 # Keep Wi-Fi/LwIP RX control blocks in internal RAM. MiPlay decoding heavily
 # uses PSRAM, and corrupting an external-RAM pbuf crashes in wifi_free().
 # CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP is not set
-# 禁用 PSRAM 栈后，原来放 PSRAM 的 lvgl/touch/audio 栈全部走内部 SRAM，保留 64KB
-CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
+# 内部预留 32KB：内部 SRAM 共约 200KB 可用，预留额度是"锁死不参与通用分配"的部分。
+# 留 32KB 即可覆盖 DMA 描述符/中断上下文等必须内部的分配。
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 # 小对象（<=512 字节）留内部 DRAM，更大的 malloc 去 PSRAM
 # semaphore / DMA 描述符仍远小于 512；512-1024 的缓冲不再挤内部堆
@@ -117,10 +121,16 @@ CONFIG_GMF_AUDIO_EFFECT_INIT_ALC=y
 CONFIG_GMF_AUDIO_EFFECT_INIT_CH_CVT=n
 # 位深转换：不需要（DLNA 源已是 16-bit，PCM5102A 直接输出）
 CONFIG_GMF_AUDIO_EFFECT_INIT_BIT_CVT=n
-# 解码器：MP3（choice，只能选一个；解码器本身支持自动探测格式）
+# 解码器：AAC（choice 单选，取 Kconfig 上游默认值）。
+# MiPlay 投屏推的是 MPEG-TS 里的 AAC（TS_PARSER: pmt type=15），
+# 之前选 MP3 会让 GMF 的 aud_dec 按 MP3 注册 → AAC 流掉进
+# esp_audio_simple_dec 的动态探测 fallback 慢路径 → imdct_fxp 卡 10s
+# → task_wdt 超时复位（投屏 ~7.5s 后重启，表现为"投 5 秒就不行"）。
+# MP3 仍可解：esp_audio_simple_dec 运行时会探测格式，且
+# CONFIG_AUDIO_DECODER_MP3_SUPPORT 保持 y（DLNA 通路不受影响，仅非快速路径）。
 CONFIG_GMF_AUDIO_CODEC_INIT_DECODER=y
 CONFIG_GMF_AUDIO_CODEC_INIT_ENCODER=n
-CONFIG_GMF_AUDIO_CODEC_DECODER_TYPE_MP3=y
+CONFIG_GMF_AUDIO_CODEC_DECODER_TYPE_AAC=y
 # codec_dev 输出缓冲
 # codec_dev 输出缓冲（32KB ≈ 185ms @44.1kHz/16bit/stereo，减少音频延迟）
 CONFIG_GMF_IO_CODEC_DEV_TX_OUT_BUF_SIZE=32768
@@ -147,6 +157,13 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 # === CPU 频率与日志级别 ===
 #
 CONFIG_LOG_DEFAULT_LEVEL=3
+# 编译期允许的最高级别 = DEBUG，否则 esp_log_level_set(TAG, ESP_LOG_DEBUG)
+# 会被静默钳制回 INFO，dlna.c:2592 的 "UI: pos/dur/state/source" 那行
+# ESP_LOGD 根本不会编进固件（LOG_MAXIMUM_LEVEL < DEBUG 时展开为空）。
+# DEFAULT_LEVEL 保持 INFO，避免全系统刷日志拖慢实时性；
+# 只有 dlna.c 里显式 esp_log_level_set 的 TAG 会输出 DEBUG。
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+CONFIG_LOG_MAXIMUM_LEVEL=4
 CONFIG_LOG_COLORS=y
 CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240

@@ -1,0 +1,398 @@
+﻿espcoredump.py v1.16.0
+===============================================================
+==================== ESP32 CORE DUMP START ====================
+The ROM ELF file won't be loaded automatically since you are running the utility out of IDF.
+
+Crashed task handle: 0x3fcde404, name: 'miplay_audio', GDB name: 'process 1070457860'
+Crashed task is not in the interrupt context
+Panic reason: Task watchdog got triggered. The following tasks/users did not reset the watchdog in time:
+ - IDLE0 (CPU 0)
+
+================== CURRENT THREAD REGISTERS ===================
+exccause       0x3c1fb854 (Invalid EXCCAUSE code)
+excvaddr       0x0
+epc1           0x40044290
+epc2           0x0
+epc3           0x0
+epc4           0x0
+epc5           0x0
+epc6           0x0
+eps2           0x0
+eps3           0x0
+eps4           0x0
+eps5           0x0
+eps6           0x0
+pc             0x42064f82          0x42064f82 <fft_rx4_long+246>
+lbeg           0x400570e8          1074098408
+lend           0x400570f3          1074098419
+lcount         0x0                 0
+sar            0x1                 1
+ps             0x60e20             396832
+threadptr      <unavailable>
+br             <unavailable>
+scompare1      <unavailable>
+acclo          <unavailable>
+acchi          <unavailable>
+m0             <unavailable>
+m1             <unavailable>
+m2             <unavailable>
+m3             <unavailable>
+fcr            <unavailable>
+fsr            <unavailable>
+pwrctl         <unavailable>
+pwrstat        <unavailable>
+eristat        <unavailable>
+cs_itctrl      <unavailable>
+cs_claimset    <unavailable>
+cs_claimclr    <unavailable>
+cs_lockaccess  <unavailable>
+cs_lockstatus  <unavailable>
+cs_authstatus  <unavailable>
+fault_info     <unavailable>
+trax_id        <unavailable>
+trax_control   <unavailable>
+trax_status    <unavailable>
+trax_data      <unavailable>
+trax_address   <unavailable>
+trax_pctrigger <unavailable>
+trax_pcmatch   <unavailable>
+trax_delay     <unavailable>
+trax_memstart  <unavailable>
+trax_memend    <unavailable>
+pmg            <unavailable>
+pmpc           <unavailable>
+pm0            <unavailable>
+pm1            <unavailable>
+pmctrl0        <unavailable>
+pmctrl1        <unavailable>
+pmstat0        <unavailable>
+pmstat1        <unavailable>
+ocdid          <unavailable>
+ocd_dcrclr     <unavailable>
+ocd_dcrset     <unavailable>
+ocd_dsr        <unavailable>
+a0             0x8204e9f5          -2113607179
+a1             0x3c8ec410          1015989264
+a2             0x7a7c0000          2054946816
+a3             0x25280000          623378432
+a4             0x200               512
+a5             0x6d2c4             447172
+a6             0x66cf0000          1724841984
+a7             0x3ca49340          1017418560
+a8             0x3c1faeb0          1008709296
+a9             0x1b                27
+a10            0xff                255
+a11            0x3ca48948          1017416008
+a12            0x3ca48d48          1017417032
+a13            0x3ca49140          1017418048
+a14            0x3ca49540          1017419072
+a15            0x3ca49740          1017419584
+
+==================== CURRENT THREAD STACK =====================
+#0  0x42064f82 in fft_rx4_long ()
+#1  0x4204e9f5 in mix_radix_fft ()
+#2  0x4204da49 in imdct_fxp ()
+#3  0x42027d80 in trans4m_freq_2_time_fxp_2 ()
+#4  0x42024770 in PVMP4AudioDecodeFrame ()
+#5  0x42023d2d in esp_aac_dec_decode ()
+#6  0x42086792 in esp_audio_dec_process ()
+#7  0x4206f89c in esp_audio_simple_dec_process ()
+#8  0x42071363 in esp_ts_dec_decode ()
+#9  0x42086792 in esp_audio_dec_process ()
+#10 0x4206f89c in esp_audio_simple_dec_process ()
+#11 0x4201b80d in esp_gmf_audio_dec_process (self=0x3c8e6568, para=<optimized out>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/gmf_audio/esp_gmf_audio_dec.c:467
+#12 0x4201cec4 in esp_gmf_element_process_running (handle=0x3c8e6568, para=0x0) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/gmf_core/src/esp_gmf_element.c:300
+#13 0x4202123e in __process_func (para=<optimized out>, handle=0x3fcde274) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/gmf_core/src/esp_gmf_task.c:314
+#14 esp_gmf_thread_fun (pv=0x3fcde274) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/gmf_core/src/esp_gmf_task.c:454
+#15 0x40381948 in vPortTaskWrapper (pxCode=0x42020fb0 <esp_gmf_thread_fun>, pvParameters=0x3fcde274) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:139
+
+======================== THREADS INFO =========================
+  Id   Target Id          Frame 
+* 1    process 1070457860 0x42064f82 in fft_rx4_long ()
+  2    process 1070478524 0x420a2c74 in img_draw_core (draw_unit=0x3fca8834 <work_mem_int+3224>, draw_dsc=0x3fcb0e98 <work_mem_int+37628>, decoder_dsc=<optimized out>, sup=0x3fcc6750, img_coords=0x3fcb0fbc <work_mem_int+37920>, clipped_img_area=<optimized out>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/sw/lv_draw_sw_img.c:322
+  3    process 1070502996 0x42008f49 in uart_ll_get_txfifo_len (hw=<optimized out>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/hal/esp32s3/include/hal/uart_ll.h:427
+  4    process 1070231408 charge_monitor_task (arg=0x0) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/main/dlna.c:2951
+  5    process 1070462540 0x400559e0 in ?? ()
+  6    process 1070321328 vPortTaskWrapper (pxCode=0x0, pvParameters=0x0) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:138
+  7    process 1070321716 vPortTaskWrapper (pxCode=0x0, pvParameters=0x0) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:138
+  8    process 1070496600 0x400559e0 in ?? ()
+  9    process 1070493820 0x400559e0 in ?? ()
+  10   process 1070496244 mdns_announce_task (arg=<optimized out>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/miplay/miplay.c:5696
+  11   process 1070494364 0x400559e0 in ?? ()
+  12   process 1070301952 0x400559e0 in ?? ()
+  13   process 1070327500 0x4037da26 in esp_cpu_wait_for_intr () at E:/ESP/.espressif/v5.5.4/esp-idf/components/esp_hw_support/cpu.c:64
+  14   process 1070329396 0x4037da26 in esp_cpu_wait_for_intr () at E:/ESP/.espressif/v5.5.4/esp-idf/components/esp_hw_support/cpu.c:64
+  15   process 1070477760 0x400559e0 in ?? ()
+  16   process 1070510596 0x400559e0 in ?? ()
+  17   process 1070319476 0x400559e0 in ?? ()
+
+
+       TCB             NAME PRIO C/B  STACK USED/FREE
+---------- ---------------- -------- ----------------
+0x3fcde404     miplay_audio      8/8       1840/22724
+0x3fce34bc        lvgl_tick      5/5       3664/29096
+0x3fce9454       miplay_cli      5/5     10800/251328
+0x3fca6f70       charge_mon      4/4         576/3512
+0x3fcdf64c       pos_notify      4/4        688/15680
+0x3fcbceb0          nvs_vol      3/3         512/1524
+0x3fcbd034          nvs_vol      3/3         512/1520
+0x3fce7b58        ui_update      3/3        784/23780
+0x3fce707c       miplay_lan      3/3       1616/10656
+0x3fce79f4         mdns_ann      3/3       1680/10600
+0x3fce729c     airkan_probe      3/3        2720/2396
+0x3fcb8300             mdns      1/1         704/3380
+0x3fcbe6cc            IDLE0      0/0          640/888
+0x3fcbee34            IDLE1      0/0          640/880
+0x3fce31c0     touch_sample      6/6        768/11508
+0x3fceb204              tiT    18/18         752/2816
+0x3fcbc774         media_rx      8/8      1296/129772
+
+==================== THREAD 1 (TCB: 0x3fcde404, name: 'miplay_audio') =====================
+#0  0x42064f82 in fft_rx4_long ()
+#1  0x4204e9f5 in mix_radix_fft ()
+#2  0x4204da49 in imdct_fxp ()
+#3  0x42027d80 in trans4m_freq_2_time_fxp_2 ()
+#4  0x42024770 in PVMP4AudioDecodeFrame ()
+#5  0x42023d2d in esp_aac_dec_decode ()
+#6  0x42086792 in esp_audio_dec_process ()
+#7  0x4206f89c in esp_audio_simple_dec_process ()
+#8  0x42071363 in esp_ts_dec_decode ()
+#9  0x42086792 in esp_audio_dec_process ()
+#10 0x4206f89c in esp_audio_simple_dec_process ()
+#11 0x4201b80d in esp_gmf_audio_dec_process (self=0x3c8e6568, para=<optimized out>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/gmf_audio/esp_gmf_audio_dec.c:467
+#12 0x4201cec4 in esp_gmf_element_process_running (handle=0x3c8e6568, para=0x0) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/gmf_core/src/esp_gmf_element.c:300
+#13 0x4202123e in __process_func (para=<optimized out>, handle=0x3fcde274) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/gmf_core/src/esp_gmf_task.c:314
+#14 esp_gmf_thread_fun (pv=0x3fcde274) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/gmf_core/src/esp_gmf_task.c:454
+#15 0x40381948 in vPortTaskWrapper (pxCode=0x42020fb0 <esp_gmf_thread_fun>, pvParameters=0x3fcde274) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:139
+
+==================== THREAD 2 (TCB: 0x3fce34bc, name: 'lvgl_tick') =====================
+#0  0x420a2c74 in img_draw_core (draw_unit=0x3fca8834 <work_mem_int+3224>, draw_dsc=0x3fcb0e98 <work_mem_int+37628>, decoder_dsc=<optimized out>, sup=0x3fcc6750, img_coords=0x3fcb0fbc <work_mem_int+37920>, clipped_img_area=<optimized out>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/sw/lv_draw_sw_img.c:322
+#1  0x4209f378 in img_decode_and_draw (draw_unit=0x3fca8834 <work_mem_int+3224>, draw_dsc=0x3fcb0e98 <work_mem_int+37628>, decoder_dsc=0x3fcc67a0, relative_decoded_area=0x0, img_area=0x3fcb0fbc <work_mem_int+37920>, clipped_img_area=0x3fcc67ec, draw_core_cb=draw_core_cb@entry=0x420a29ac <img_draw_core>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/lv_draw_image.c:285
+#2  0x4209f7db in lv_draw_image_normal_helper (draw_unit=0x3fca8834 <work_mem_int+3224>, draw_dsc=0x3fcb0e98 <work_mem_int+37628>, coords=0x3fcb0fbc <work_mem_int+37920>, draw_core_cb=0x420a29ac <img_draw_core>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/lv_draw_image.c:178
+#3  0x420a304c in lv_draw_sw_image (draw_unit=0x3fca8834 <work_mem_int+3224>, draw_dsc=0x3fcb0e98 <work_mem_int+37628>, coords=0x3fcb0fbc <work_mem_int+37920>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/sw/lv_draw_sw_img.c:169
+#4  lv_draw_sw_image (draw_unit=0x3fca8834 <work_mem_int+3224>, draw_dsc=0x3fcb0e98 <work_mem_int+37628>, coords=0x3fcb0fbc <work_mem_int+37920>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/sw/lv_draw_sw_img.c:165
+#5  0x420a094d in execute_drawing (u=0x3fca8834 <work_mem_int+3224>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/sw/lv_draw_sw.c:518
+#6  execute_drawing_unit (u=0x3fca8834 <work_mem_int+3224>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/sw/lv_draw_sw.c:383
+#7  dispatch (draw_unit=0x3fca8834 <work_mem_int+3224>, layer=0x3fcb0e48 <work_mem_int+37548>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/sw/lv_draw_sw.c:463
+#8  dispatch (draw_unit=0x3fca8834 <work_mem_int+3224>, layer=0x3fcb0e48 <work_mem_int+37548>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/sw/lv_draw_sw.c:430
+#9  0x4209e9ae in lv_draw_dispatch_layer (disp=<optimized out>, layer=0x3fcb0e48 <work_mem_int+37548>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/lv_draw.c:276
+#10 0x4209e9f5 in lv_draw_dispatch () at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/lv_draw.c:182
+#11 0x4209ea4e in lv_draw_finalize_task_creation (layer=<optimized out>, t=0x3fcb0fb4 <work_mem_int+37912>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/lv_draw.c:147
+#12 0x4209f730 in lv_draw_image (layer=0x3fcb0e48 <work_mem_int+37548>, dsc=0x3fcc6920, coords=0x3fcc698c) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/lv_draw_image.c:122
+#13 0x420b872c in draw_image (e=<optimized out>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/widgets/image/lv_image.c:794
+#14 lv_image_event (class_p=<optimized out>, e=<optimized out>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/widgets/image/lv_image.c:684
+#15 0x4217bec4 in lv_obj_event_base (class_p=0x0, e=0x3fcc6a20) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_obj_event.c:89
+#16 0x42098c61 in event_send_core (e=0x3fcc6a20) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_obj_event.c:364
+#17 0x42098cef in lv_obj_send_event (obj=<optimized out>, event_code=LV_EVENT_DRAW_MAIN, param=0x3fcb0e48 <work_mem_int+37548>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_obj_event.c:67
+#18 0x4209ce84 in lv_obj_redraw (layer=0x3fcb0e48 <work_mem_int+37548>, obj=0x3fca9cc0 <work_mem_int+8484>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:116
+#19 0x4209d16a in refr_obj (layer=0x3fcb0e48 <work_mem_int+37548>, obj=0x3fca9cc0 <work_mem_int+8484>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:1032
+#20 refr_obj (layer=0x3fcb0e48 <work_mem_int+37548>, obj=0x3fca9cc0 <work_mem_int+8484>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:1015
+#21 0x4209d08f in lv_obj_redraw (layer=0x3fca8c54 <work_mem_int+4280>, obj=0x3fca9c1c <work_mem_int+8320>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:218
+#22 0x4209d16a in refr_obj (layer=0x3fca8c54 <work_mem_int+4280>, obj=0x3fca9c1c <work_mem_int+8320>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:1032
+#23 refr_obj (layer=0x3fca8c54 <work_mem_int+4280>, obj=0x3fca9c1c <work_mem_int+8320>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:1015
+#24 0x4209cf41 in lv_obj_redraw (layer=0x3fca8c54 <work_mem_int+4280>, obj=0x3fca9814 <work_mem_int+7288>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:167
+#25 0x4209d16a in refr_obj (layer=0x3fca8c54 <work_mem_int+4280>, obj=0x3fca9814 <work_mem_int+7288>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:1032
+#26 refr_obj (layer=0x3fca8c54 <work_mem_int+4280>, obj=0x3fca9814 <work_mem_int+7288>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:1015
+#27 0x4209d4e6 in refr_obj_and_children (layer=0x3fca8c54 <work_mem_int+4280>, top_obj=<optimized out>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:820
+#28 0x4209d628 in refr_area_part (layer=0x3fca8c54 <work_mem_int+4280>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:753
+#29 0x4209de61 in refr_area (area_p=<optimized out>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:679
+#30 refr_invalid_areas () at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:586
+#31 lv_display_refr_timer (tmr=<optimized out>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:398
+#32 0x420af7bd in lv_timer_exec (timer=0x3fca8ca4 <work_mem_int+4360>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/misc/lv_timer.c:326
+#33 lv_timer_handler () at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/misc/lv_timer.c:107
+#34 lv_timer_handler () at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/misc/lv_timer.c:63
+#35 0x4208feef in lvgl_tick_task (arg=0x0) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl_port/lvgl_port_disp.c:57
+#36 0x40381948 in vPortTaskWrapper (pxCode=0x4208fee0 <lvgl_tick_task>, pvParameters=0x0) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:139
+
+==================== THREAD 3 (TCB: 0x3fce9454, name: 'miplay_cli') =====================
+#0  0x42008f49 in uart_ll_get_txfifo_len (hw=<optimized out>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/hal/esp32s3/include/hal/uart_ll.h:427
+#1  uart_tx_char (fd=<optimized out>, c=58) at E:/ESP/.espressif/v5.5.4/esp-idf/components/esp_driver_uart/src/uart_vfs.c:190
+#2  0x4200995d in uart_write (fd=0, data=<optimized out>, size=91) at E:/ESP/.espressif/v5.5.4/esp-idf/components/esp_driver_uart/src/uart_vfs.c:245
+#3  0x4200b600 in esp_vfs_write (r=0x3fce94b0, fd=0, data=0x3fcb9b0c, size=91) at E:/ESP/.espressif/v5.5.4/esp-idf/components/vfs/vfs.c:983
+#4  0x42168645 in write (fd=0, buf=0x3fcb9b0c, cnt=91) at /builds/idf/crosstool-NG/.build/xtensa-esp-elf/src/newlib/newlib/libc/syscalls/syswrite.c:11
+#5  0x4200ac38 in console_write (fd=<optimized out>, data=0x3fcb9b0c, size=91) at E:/ESP/.espressif/v5.5.4/esp-idf/components/esp_vfs_console/vfs_console.c:83
+#6  0x4200b600 in esp_vfs_write (r=0x3fce94b0, fd=3, data=0x3fcb9b0c, size=91) at E:/ESP/.espressif/v5.5.4/esp-idf/components/vfs/vfs.c:983
+#7  0x4216721d in __swrite (ptr=0x3fce94b0, cookie=0x3fcb98c4, buf=0x3fcb9b0c <error: Cannot access memory at address 0x3fcb9b0c>, n=91) at /builds/idf/crosstool-NG/.build/xtensa-esp-elf/src/newlib/newlib/libc/stdio/stdio.c:94
+#8  0x421664cc in __sflush_r (ptr=0x3fce94b0, fp=0x3fcb98c4) at /builds/idf/crosstool-NG/.build/xtensa-esp-elf/src/newlib/newlib/libc/stdio/fflush.c:224
+#9  0x4216651e in _fflush_r (ptr=0x3fce94b0, fp=0x3fcb98c4) at /builds/idf/crosstool-NG/.build/xtensa-esp-elf/src/newlib/newlib/libc/stdio/fflush.c:278
+#10 0x42166bd0 in __sfvwrite_r (ptr=0x3fce94b0, fp=0x3fcb98c4, uio=0x3c9b67b4) at /builds/idf/crosstool-NG/.build/xtensa-esp-elf/src/newlib/newlib/libc/stdio/fvwrite.c:251
+#11 0x42173976 in __sprint_r (ptr=<optimized out>, fp=0x3fcb98c4, uio=0x3c9b67b4) at /builds/idf/crosstool-NG/.build/xtensa-esp-elf/src/newlib/newlib/libc/stdio/vfprintf.c:429
+#12 __sprint_r (ptr=<optimized out>, fp=0x3fcb98c4, uio=0x3c9b67b4) at /builds/idf/crosstool-NG/.build/xtensa-esp-elf/src/newlib/newlib/libc/stdio/vfprintf.c:399
+#13 0x4217386d in _vfprintf_r (data=<optimized out>, fp=<optimized out>, fmt0=<optimized out>, ap=...) at /builds/idf/crosstool-NG/.build/xtensa-esp-elf/src/newlib/newlib/libc/stdio/vfprintf.c:1774
+#14 0x42167294 in vprintf (fmt=0x3c1a35b8 "\033[0;32mI (%lu) %s:   %04X  %-48s |%s|\033[0m
+", ap=...) at /builds/idf/crosstool-NG/.build/xtensa-esp-elf/src/newlib/newlib/libc/stdio/vprintf.c:34
+#15 0x40388189 in esp_log_va (config=..., tag=0x3c199d9d "miplay", format=0x3c1a35b8 "\033[0;32mI (%lu) %s:   %04X  %-48s |%s|\033[0m
+", args=...) at E:/ESP/.espressif/v5.5.4/esp-idf/components/log/src/log.c:43
+#16 esp_log (config=..., tag=0x3c199d9d "miplay", format=0x3c1a35b8 "\033[0;32mI (%lu) %s:   %04X  %-48s |%s|\033[0m
+") at E:/ESP/.espressif/v5.5.4/esp-idf/components/log/src/log.c:88
+#17 0x42086fb8 in dump_hex (data=0x3c9b8d84 <error: Cannot access memory at address 0x3c9b8d84>, len=<optimized out>, label=<optimized out>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/miplay/miplay.c:516
+#18 0x4208c60d in handle_client (session=<optimized out>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/miplay/miplay.c:4049
+#19 0x4208ec5f in miplay_client_task (arg=0x3c87dbf0 <s_sessions>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/miplay/miplay.c:5435
+#20 0x40381948 in vPortTaskWrapper (pxCode=0x4208ec1c <miplay_client_task>, pvParameters=0x3c87dbf0 <s_sessions>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:139
+
+==================== THREAD 4 (TCB: 0x3fca6f70, name: 'charge_mon') =====================
+#0  charge_monitor_task (arg=0x0) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/main/dlna.c:2951
+#1  0x40381948 in vPortTaskWrapper (pxCode=0x4200eb00 <charge_monitor_task>, pvParameters=0x0) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:139
+
+==================== THREAD 5 (TCB: 0x3fcdf64c, name: 'pos_notify') =====================
+#0  0x400559e0 in ?? ()
+#1  0x40381c02 in vPortClearInterruptMaskFromISR (prev_level=<optimized out>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/include/freertos/portmacro.h:560
+#2  vPortExitCritical (mux=0x3fcdf640) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:514
+#3  0x403817a5 in xQueueSemaphoreTake (xQueue=0x3fcdf5f4, xTicksToWait=<optimized out>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/queue.c:1853
+#4  0x4201662a in pos_notify_task (arg=0x0) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/custom_dlna/custom_dlna.c:671
+#5  0x40381948 in vPortTaskWrapper (pxCode=0x42016618 <pos_notify_task>, pvParameters=0x0) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:139
+
+==================== THREAD 6 (TCB: 0x3fcbceb0, name: 'nvs_vol') =====================
+#0  vPortTaskWrapper (pxCode=0x0, pvParameters=0x0) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:138
+#1  0x40000000 in ?? ()
+
+==================== THREAD 7 (TCB: 0x3fcbd034, name: 'nvs_vol') =====================
+#0  vPortTaskWrapper (pxCode=0x0, pvParameters=0x0) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:138
+#1  0x40000000 in ?? ()
+
+==================== THREAD 8 (TCB: 0x3fce7b58, name: 'ui_update') =====================
+#0  0x400559e0 in ?? ()
+#1  0x40381c02 in vPortClearInterruptMaskFromISR (prev_level=<optimized out>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/include/freertos/portmacro.h:560
+#2  vPortExitCritical (mux=0x3fce004c) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:514
+#3  0x403813bc in xQueueGenericSend (xQueue=0x3fce0000, pvItemToQueue=0x0, xTicksToWait=<optimized out>, xCopyPosition=0) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/queue.c:1056
+#4  0x4208fede in lvgl_port_unlock () at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl_port/lvgl_port_disp.c:117
+#5  0x42011bed in ui_update_task (arg=<optimized out>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/main/dlna.c:2749
+#6  0x40381948 in vPortTaskWrapper (pxCode=0x42011950 <ui_update_task>, pvParameters=0x0) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:139
+
+==================== THREAD 9 (TCB: 0x3fce707c, name: 'miplay_lan') =====================
+#0  0x400559e0 in ?? ()
+#1  0x40381c02 in vPortClearInterruptMaskFromISR (prev_level=<optimized out>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/include/freertos/portmacro.h:560
+#2  vPortExitCritical (mux=0x3fce6e80) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:514
+#3  0x403816c2 in xQueueReceive (xQueue=0x3fce6e34, pvBuffer=0x3c96d4c0, xTicksToWait=<optimized out>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/queue.c:1632
+#4  0x420f8965 in sys_arch_mbox_fetch (mbox=0x3fce6e04, msg=0x3c96d4c0, timeout=<optimized out>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/lwip/port/freertos/sys_arch.c:313
+#5  0x420f928e in netconn_recv_data (conn=0x3fce6df4, new_buf=0x3c96d510, apiflags=<optimized out>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/lwip/lwip/src/api/api_lib.c:618
+#6  0x420f9346 in netconn_recv_udp_raw_netbuf_flags (conn=<optimized out>, new_buf=0x3c96d510, apiflags=0 '\000') at E:/ESP/.espressif/v5.5.4/esp-idf/components/lwip/lwip/src/api/api_lib.c:850
+#7  0x420e8162 in lwip_recvfrom_udp_raw (sock=0x3c88f62c <sockets+120>, flags=0, msg=0x3c96d550, datagram_len=0x3c96d574, dbg_s=<optimized out>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/lwip/lwip/src/api/sockets.c:1156
+#8  0x420e978f in lwip_recvfrom (s=<optimized out>, mem=0x3c96d5c0, len=512, flags=0, from=0x3c96d7c0, fromlen=0x3c96d808) at E:/ESP/.espressif/v5.5.4/esp-idf/components/lwip/lwip/src/api/sockets.c:1277
+#9  0x4208a55b in recvfrom (s=<optimized out>, mem=0x3c96d5c0, len=512, flags=0, from=0x3c96d7c0, fromlen=0x3c96d808) at E:/ESP/.espressif/v5.5.4/esp-idf/components/lwip/include/lwip/sockets.h:62
+#10 miplay_lan_task (arg=<optimized out>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/miplay/miplay.c:940
+#11 0x40381948 in vPortTaskWrapper (pxCode=0x4208a38c <miplay_lan_task>, pvParameters=0x0) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:139
+
+==================== THREAD 10 (TCB: 0x3fce79f4, name: 'mdns_ann') =====================
+#0  mdns_announce_task (arg=<optimized out>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/miplay/miplay.c:5696
+#1  0x40381948 in vPortTaskWrapper (pxCode=0x4208a66c <mdns_announce_task>, pvParameters=0x0) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:139
+
+==================== THREAD 11 (TCB: 0x3fce729c, name: 'airkan_probe') =====================
+#0  0x400559e0 in ?? ()
+#1  0x40381c02 in vPortClearInterruptMaskFromISR (prev_level=<optimized out>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/include/freertos/portmacro.h:560
+#2  vPortExitCritical (mux=0x3fce7538) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:514
+#3  0x403817a5 in xQueueSemaphoreTake (xQueue=0x3fce74ec, xTicksToWait=<optimized out>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/queue.c:1853
+#4  0x420f8881 in sys_arch_sem_wait (sem=0x3fce74dc, timeout=1000) at E:/ESP/.espressif/v5.5.4/esp-idf/components/lwip/port/freertos/sys_arch.c:175
+#5  0x420e9cfc in lwip_select (maxfdp1=43, readset=0x3c96ec10, writeset=0x0, exceptset=0x0, timeout=0x3c96ec00) at E:/ESP/.espressif/v5.5.4/esp-idf/components/lwip/lwip/src/api/sockets.c:2142
+#6  0x4200bc10 in esp_vfs_select (nfds=43, readfds=0x3c96ec10, writefds=0x0, errorfds=0x0, timeout=0x3c96ec00) at E:/ESP/.espressif/v5.5.4/esp-idf/components/vfs/vfs.c:1620
+#7  0x4208ac24 in airkan_probe_task (arg=<optimized out>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/miplay/miplay.c:5091
+#8  0x40381948 in vPortTaskWrapper (pxCode=0x4208aa48 <airkan_probe_task>, pvParameters=0x0) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:139
+
+==================== THREAD 12 (TCB: 0x3fcb8300, name: 'mdns') =====================
+#0  0x400559e0 in ?? ()
+#1  0x40381c02 in vPortClearInterruptMaskFromISR (prev_level=<optimized out>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/include/freertos/portmacro.h:560
+#2  vPortExitCritical (mux=0x3fcd7270) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:514
+#3  0x403816c2 in xQueueReceive (xQueue=0x3fcd7224, pvBuffer=0x3c896e70, xTicksToWait=<optimized out>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/queue.c:1632
+#4  0x420d0778 in service_task (pvParameters=0x0) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/managed_components/espressif__mdns/mdns_service.c:226
+#5  0x40381948 in vPortTaskWrapper (pxCode=0x420d0754 <service_task>, pvParameters=0x0) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:139
+
+==================== THREAD 13 (TCB: 0x3fcbe6cc, name: 'IDLE0') =====================
+#0  0x4037da26 in esp_cpu_wait_for_intr () at E:/ESP/.espressif/v5.5.4/esp-idf/components/esp_hw_support/cpu.c:64
+#1  0x42189ef8 in esp_vApplicationIdleHook () at E:/ESP/.espressif/v5.5.4/esp-idf/components/esp_system/freertos_hooks.c:58
+#2  0x4038295e in prvIdleTask (pvParameters=0x0) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/tasks.c:4350
+#3  0x40381948 in vPortTaskWrapper (pxCode=0x403828e0 <prvIdleTask>, pvParameters=0x0) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:139
+
+==================== THREAD 14 (TCB: 0x3fcbee34, name: 'IDLE1') =====================
+#0  0x4037da26 in esp_cpu_wait_for_intr () at E:/ESP/.espressif/v5.5.4/esp-idf/components/esp_hw_support/cpu.c:64
+#1  0x42189ef8 in esp_vApplicationIdleHook () at E:/ESP/.espressif/v5.5.4/esp-idf/components/esp_system/freertos_hooks.c:58
+#2  0x4038295e in prvIdleTask (pvParameters=0x0) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/tasks.c:4350
+#3  0x40381948 in vPortTaskWrapper (pxCode=0x403828e0 <prvIdleTask>, pvParameters=0x0) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:139
+
+==================== THREAD 15 (TCB: 0x3fce31c0, name: 'touch_sample') =====================
+#0  0x400559e0 in ?? ()
+#1  0x40381c02 in vPortClearInterruptMaskFromISR (prev_level=<optimized out>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/include/freertos/portmacro.h:560
+#2  vPortExitCritical (mux=0x3fc9fac8 <xKernelLock>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:514
+#3  0x40383e6d in ulTaskGenericNotifyTake (uxIndexToWait=0, xClearCountOnExit=1, xTicksToWait=20) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/tasks.c:5768
+#4  0x42090019 in touch_sample_task (arg=<optimized out>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl_port/lvgl_port_touch.c:138
+#5  0x40381948 in vPortTaskWrapper (pxCode=0x42090004 <touch_sample_task>, pvParameters=0x0) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:139
+
+==================== THREAD 16 (TCB: 0x3fceb204, name: 'tiT') =====================
+#0  0x400559e0 in ?? ()
+#1  0x40381c02 in vPortClearInterruptMaskFromISR (prev_level=<optimized out>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/include/freertos/portmacro.h:560
+#2  vPortExitCritical (mux=0x3fcea370) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:514
+#3  0x403816c2 in xQueueReceive (xQueue=0x3fcea324, pvBuffer=0x3fceb060, xTicksToWait=<optimized out>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/queue.c:1632
+#4  0x420f8965 in sys_arch_mbox_fetch (mbox=0x3c88fd34 <tcpip_mbox>, msg=0x3fceb060, timeout=<optimized out>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/lwip/port/freertos/sys_arch.c:313
+#5  0x420ea111 in tcpip_timeouts_mbox_fetch (mbox=<optimized out>, msg=<optimized out>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/lwip/lwip/src/api/tcpip.c:104
+#6  tcpip_thread (arg=0x0) at E:/ESP/.espressif/v5.5.4/esp-idf/components/lwip/lwip/src/api/tcpip.c:142
+#7  0x40381948 in vPortTaskWrapper (pxCode=0x420ea0bc <tcpip_thread>, pvParameters=0x0) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:139
+
+==================== THREAD 17 (TCB: 0x3fcbc774, name: 'media_rx') =====================
+#0  0x400559e0 in ?? ()
+#1  0x40381c02 in vPortClearInterruptMaskFromISR (prev_level=<optimized out>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/include/freertos/portmacro.h:560
+#2  vPortExitCritical (mux=0x3fcbc438) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:514
+#3  0x403816c2 in xQueueReceive (xQueue=0x3fcbc3ec, pvBuffer=0x3ca3bdf0, xTicksToWait=<optimized out>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/queue.c:1632
+#4  0x420f8965 in sys_arch_mbox_fetch (mbox=0x3fcbc3ac, msg=0x3ca3bdf0, timeout=<optimized out>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/lwip/port/freertos/sys_arch.c:313
+#5  0x420f928e in netconn_recv_data (conn=0x3fcbc39c, new_buf=0x3ca3be90, apiflags=<optimized out>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/lwip/lwip/src/api/api_lib.c:618
+#6  0x420f9399 in netconn_recv_data_tcp (conn=0x3fcbc39c, new_buf=0x3ca3be90, apiflags=8 '\b') at E:/ESP/.espressif/v5.5.4/esp-idf/components/lwip/lwip/src/api/api_lib.c:730
+#7  0x420f93fe in netconn_recv_tcp_pbuf_flags (conn=<optimized out>, new_buf=0x3ca3be90, apiflags=8 '\b') at E:/ESP/.espressif/v5.5.4/esp-idf/components/lwip/lwip/src/api/api_lib.c:811
+#8  0x420e7f58 in lwip_recv_tcp (sock=0x3c88f708 <sockets+340>, mem=0x3ca3bfc0, len=<optimized out>, flags=<optimized out>) at E:/ESP/.espressif/v5.5.4/esp-idf/components/lwip/lwip/src/api/sockets.c:990
+#9  0x420e972f in lwip_recvfrom (s=<optimized out>, mem=0x3ca3bfc0, len=4, flags=0, from=0x0, fromlen=0x0) at E:/ESP/.espressif/v5.5.4/esp-idf/components/lwip/lwip/src/api/sockets.c:1257
+#10 0x420e97f9 in lwip_recv (s=49, mem=0x3ca3bfc0, len=4, flags=0) at E:/ESP/.espressif/v5.5.4/esp-idf/components/lwip/lwip/src/api/sockets.c:1322
+#11 0x4208999c in recv (s=49, mem=0x3ca3bfc0, len=4, flags=0) at E:/ESP/.espressif/v5.5.4/esp-idf/components/lwip/include/lwip/sockets.h:60
+#12 media_receive_task (arg=<optimized out>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/miplay/miplay.c:3213
+#13 0x40381948 in vPortTaskWrapper (pxCode=0x42089804 <media_receive_task>, pvParameters=0x3fcbc74c) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:139
+
+
+======================= ALL MEMORY REGIONS ========================
+Name   Address   Size   Attrs
+.rtc.text 0x600fe000 0x0 RW  
+.rtc.force_fast 0x600fe000 0x0 RW  
+.rtc_noinit 0x50000000 0x0 RW  
+.rtc.force_slow 0x50000000 0x20 RW A
+.iram0.vectors 0x40374000 0x404 R XA
+.iram0.text 0x40374404 0x1b463 R XA
+.dram0.data 0x3fc9f900 0x6330 RW A
+.flash.text 0x42000020 0x18b9b8 R XA
+.flash.appdesc 0x3c190020 0x100 R  A
+.flash.rodata 0x3c190120 0x5cbb80 RW A
+.iram0.data 0x4038f900 0x0 RW  
+.iram0.bss 0x4038f900 0x0 RW  
+.dram0.heap_start 0x3fcb9290 0x0 RW  
+.coredump.tasks.data 0x3fcde404 0x154 RW 
+.coredump.tasks.data 0x3c8ec350 0x730 RW 
+.coredump.tasks.data 0x3fce34bc 0x154 RW 
+.coredump.tasks.data 0x3fcc6540 0xe50 RW 
+.coredump.tasks.data 0x3fce9454 0x154 RW 
+.coredump.tasks.data 0x3c9b6340 0x2a30 RW 
+.coredump.tasks.data 0x3fca6f70 0x154 RW 
+.coredump.tasks.data 0x3c8ef060 0x240 RW 
+.coredump.tasks.data 0x3fcdf64c 0x154 RW 
+.coredump.tasks.data 0x3c90b100 0x2b0 RW 
+.coredump.tasks.data 0x3fcbceb0 0x154 RW 
+.coredump.tasks.data 0x3fcbd900 0x200 RW 
+.coredump.tasks.data 0x3fcbd034 0x154 RW 
+.coredump.tasks.data 0x3fce3c10 0x200 RW 
+.coredump.tasks.data 0x3fce7b58 0x154 RW 
+.coredump.tasks.data 0x3c977b40 0x310 RW 
+.coredump.tasks.data 0x3fce707c 0x154 RW 
+.coredump.tasks.data 0x3c96d360 0x650 RW 
+.coredump.tasks.data 0x3fce79f4 0x154 RW 
+.coredump.tasks.data 0x3c9717c0 0x690 RW 
+.coredump.tasks.data 0x3fce729c 0x154 RW 
+.coredump.tasks.data 0x3c96e320 0xaa0 RW 
+.coredump.tasks.data 0x3fcb8300 0x154 RW 
+.coredump.tasks.data 0x3c896d40 0x2c0 RW 
+.coredump.tasks.data 0x3fcbe6cc 0x154 RW 
+.coredump.tasks.data 0x3fcbe440 0x280 RW 
+.coredump.tasks.data 0x3fcbee34 0x154 RW 
+.coredump.tasks.data 0x3fcbeba0 0x280 RW 
+.coredump.tasks.data 0x3fce31c0 0x154 RW 
+.coredump.tasks.data 0x3fce2eb0 0x300 RW 
+.coredump.tasks.data 0x3fceb204 0x154 RW 
+.coredump.tasks.data 0x3fceaf00 0x2f0 RW 
+.coredump.tasks.data 0x3fcbc774 0x154 RW 
+.coredump.tasks.data 0x3ca3bc90 0x510 RW 
+
+===================== ESP32 CORE DUMP END =====================
+===============================================================
+Done!

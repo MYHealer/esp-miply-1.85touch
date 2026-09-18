@@ -1505,6 +1505,7 @@ static void _create_softap_screen(void)
     lv_obj_set_style_pad_row(qr_cell, 10, 0);
     lv_obj_clear_flag(qr_cell, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
 
+#if LV_USE_QRCODE
     s_softap_qrcode = lv_qrcode_create(qr_cell);
     lv_qrcode_set_size(s_softap_qrcode, 100);
     lv_qrcode_set_dark_color(s_softap_qrcode, lv_color_black());
@@ -1513,6 +1514,7 @@ static void _create_softap_screen(void)
     lv_obj_set_style_border_width(s_softap_qrcode, 10, 0);
     lv_qrcode_update(s_softap_qrcode, "WIFI:T:nopass;S:ESP-Brookesia;P:;;",
                      strlen("WIFI:T:nopass;S:ESP-Brookesia;P:;;"));
+#endif
     s_softap_info_label = _create_text(qr_cell, "", &esp_brookesia_font_maison_neue_book_16, C_WHITE);
     lv_obj_set_width(s_softap_info_label, 280);
     lv_obj_set_style_text_align(s_softap_info_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -1692,10 +1694,22 @@ static void _create_wlan_password_screen(void)
 static void _wlan_scan_task(void *arg)
 {
     (void)arg;
+    /* 未配网时 STA 事件处理会无退避地反复 esp_wifi_connect()，驱动长期处于
+     * CONNECTING 态，此时 esp_wifi_scan_start() 会直接返回 ESP_ERR_WIFI_STATE
+     * —— 表现就是配网页永远 "No networks found"。
+     * 扫描期间先断开连接，扫完再交回自动重连（若有已保存凭据会自行重连）。 */
+    wifi_ap_record_t cur_ap = {0};
+    bool was_connected = (esp_wifi_sta_get_ap_info(&cur_ap) == ESP_OK);
+    if (!was_connected) {
+        esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(50));   /* 等驱动落回 IDLE 态 */
+    }
+
     /* MiPlay 推流期间 WiFi 驱动繁忙，默认每信道 120ms 驻留常常空手而归。
      * 加长每信道主动扫描时间到 300ms，并把省电模式临时关掉，扫描更完整。 */
     wifi_scan_config_t config = {
-        .show_hidden = false,
+        .show_hidden = true,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
         .scan_time.active = {
             .min = 100,
             .max = 300,
@@ -1707,6 +1721,13 @@ static void _wlan_scan_task(void *arg)
     esp_err_t ret = esp_wifi_scan_start(&config, true);
     if (ret == ESP_OK) ret = esp_wifi_scan_get_ap_records(&record_count, records);
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+
+    /* 扫描完毕，恢复 STA 自动重连 */
+    if (!was_connected) esp_wifi_connect();
+
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "WLAN scan failed: %s", esp_err_to_name(ret));
+    }
 
     wlan_scan_item_t results[WLAN_SCAN_MAX_ITEMS] = {0};
     uint16_t result_count = 0;
@@ -1727,8 +1748,6 @@ static void _wlan_scan_task(void *arg)
             results[result_count].authmode = records[i].authmode;
             result_count++;
         }
-    } else {
-        ESP_LOGW(TAG, "WLAN scan failed: %s", esp_err_to_name(ret));
     }
 
     portENTER_CRITICAL(&s_wlan_scan_lock);
@@ -1800,7 +1819,7 @@ static void _apply_wlan_scan_results(void)
         }
         shown++;
     }
-    if (!count) {
+    if (shown == 0) {
         _create_wlan_network_cell(s_wlan_available_container, "No networks found", NULL,
                                   -100, false, false, false, NULL, NULL, NULL, NULL);
     }
@@ -1815,7 +1834,16 @@ static void _update_system_status(void)
     time_t now = time(NULL);
     struct tm local_time = {0};
     if (localtime_r(&now, &local_time) == NULL) memset(&local_time, 0, sizeof(local_time));
-    lv_label_set_text_fmt(s_status_time_label, "%02d:%02d", local_time.tm_hour, local_time.tm_min);
+    /* 只在文本真正变化时才写回：lv_label_set_text_fmt 每次都会 free+alloc
+     * 一个字符串，本函数每秒调用一次，无脑写回会在内部堆上形成高频
+     * 分配/释放，加剧碎片。分钟级变化用静态比较即可。 */
+    static int s_last_shown_hhmm = -1;
+    int hhmm = local_time.tm_hour * 100 + local_time.tm_min;
+    if (hhmm != s_last_shown_hhmm) {
+        s_last_shown_hhmm = hhmm;
+        lv_label_set_text_fmt(s_status_time_label, "%02d:%02d",
+                              local_time.tm_hour, local_time.tm_min);
+    }
     wifi_ap_record_t ap = {0};
     bool connected = esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
     wifi_mode_t wifi_mode = WIFI_MODE_NULL;
@@ -1830,13 +1858,22 @@ static void _update_system_status(void)
             wifi_icon = &speaker_image_middle_quick_settings_wifi_level1_20_20;
         }
     }
-    lv_img_set_src(s_status_wifi_label, wifi_icon);
+    /* 只在图标真正变化时 set：lv_img_set_src 会触发 invalidate 重绘，
+     * 每秒无条件调用于屏幕无益（静态图标内容不变），纯属浪费。 */
+    static const lv_img_dsc_t *s_last_wifi_icon;
+    if (s_last_wifi_icon != wifi_icon) {
+        s_last_wifi_icon = wifi_icon;
+        lv_img_set_src(s_status_wifi_label, wifi_icon);
+    }
     if (connected) {
         lv_obj_add_state(s_status_wifi_btn, LV_STATE_CHECKED);
     } else {
         lv_obj_clear_state(s_status_wifi_btn, LV_STATE_CHECKED);
     }
-    /* Wi-Fi 按钮下方显示当前网络名：优先已连接 AP，其次配网目标，最后 NVS 里保存的 SSID */
+    /* Wi-Fi 按钮下方显示当前网络名：只显示已连接 AP 或配网目标。
+     * 注意：不能用 esp_wifi_get_config() 兜底 —— 驱动里始终存着编译期的
+     * CONFIG_WIFI_SSID 默认值，未配网时会把它当"当前网络"显示出来，
+     * 而设备其实从未连上过那个网络。 */
     if (s_status_wifi_caption) {
         char ssid_text[33] = "Wi-Fi";
         if (connected && ap.ssid[0]) {
@@ -1846,13 +1883,6 @@ static void _update_system_status(void)
             const char *target_ssid = wifi_provision_get_target_ssid();
             if (target_ssid && target_ssid[0]) {
                 snprintf(ssid_text, sizeof(ssid_text), "%s", target_ssid);
-            } else {
-                wifi_config_t sta_cfg = {0};
-                if (esp_wifi_get_config(WIFI_IF_STA, &sta_cfg) == ESP_OK &&
-                    sta_cfg.sta.ssid[0]) {
-                    memcpy(ssid_text, sta_cfg.sta.ssid, sizeof(sta_cfg.sta.ssid));
-                    ssid_text[sizeof(ssid_text) - 1] = '\0';
-                }
             }
         }
         if (strcmp(lv_label_get_text(s_status_wifi_caption), ssid_text) != 0) {
@@ -1909,8 +1939,17 @@ static void _update_system_status(void)
     } else {
         bat_icon = &speaker_image_middle_quick_settings_battery_level1_20_20;
     }
-    lv_img_set_src(s_status_battery_icon, bat_icon);
-    lv_label_set_text_fmt(s_status_battery_label, "%d%%", s_bat_pct_cached);
+    /* 同上：图标不变就不重设，避免每秒 invalidate */
+    static const lv_img_dsc_t *s_last_bat_icon;
+    if (s_last_bat_icon != bat_icon) {
+        s_last_bat_icon = bat_icon;
+        lv_img_set_src(s_status_battery_icon, bat_icon);
+    }
+    static int s_last_bat_pct_shown = -1;
+    if (s_last_bat_pct_shown != s_bat_pct_cached) {
+        s_last_bat_pct_shown = s_bat_pct_cached;
+        lv_label_set_text_fmt(s_status_battery_label, "%d%%", s_bat_pct_cached);
+    }
 
     size_t internal_total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
     size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
@@ -2002,11 +2041,13 @@ static void _show_softap(void)
         if (ret != ESP_OK) ESP_LOGE(TAG, "Wi-Fi provisioning start failed: %s", esp_err_to_name(ret));
     }
     const char *ap_ssid = wifi_provision_get_ap_ssid();
+#if LV_USE_QRCODE
     if (s_softap_qrcode && ap_ssid && ap_ssid[0] != '\0') {
         char qr_string[128];
         snprintf(qr_string, sizeof(qr_string), "WIFI:T:nopass;S:%s;P:;;", ap_ssid);
         lv_qrcode_update(s_softap_qrcode, qr_string, strlen(qr_string));
     }
+#endif
     _show_status_panel(false);
     s_parent_screen = s_wlan_scr;
     s_return_target = s_wlan_scr;
@@ -2692,6 +2733,13 @@ void lvgl_port_ui_set_progress(int position_sec, int duration_sec) {
 static void _cover_anim_cb(void *obj, int32_t v)
 {
     (void)obj;
+    /* [DBG] 每 128 帧打一次：确认旋转动画在跑（旋转 → transformed 慢路径）。
+     * 若投屏时这里刷屏，说明封面每帧都在走 RGB565A8 分块重绘。 */
+    static uint32_t s_dbg_n = 0;
+    if ((s_dbg_n++ & 0x7F) == 0) {
+        ESP_LOGW(TAG, "[DBG] cover rotate frame=%u angle=%d core=%d",
+                 (unsigned)s_dbg_n, (int)v, xPortGetCoreID());
+    }
     if (s_cover_img) lv_img_set_angle(s_cover_img, v);
 }
 
@@ -2842,6 +2890,8 @@ static void _generate_dithered_bg(uint8_t r_top, uint8_t g_top, uint8_t b_top,
                                    uint8_t r_bot, uint8_t g_bot, uint8_t b_bot)
 {
     const int W = TFT_W, H = TFT_H;
+    static uint32_t s_bg_gen_t0_ms;
+    s_bg_gen_t0_ms = lv_tick_get();
 
     /* 首次调用分配 PSRAM 缓冲 + LVGL 图片描述符 */
     if (!s_bg_dsc) {
@@ -2897,6 +2947,13 @@ static void _generate_dithered_bg(uint8_t r_top, uint8_t g_top, uint8_t b_top,
         lv_img_set_src(s_lyrics_bg_img, s_bg_dsc);
         lv_obj_invalidate(s_lyrics_bg_img);
     }
+    /* 【诊断】全屏渐变生成 + 两张全屏 invalidate 是本函数最重的部分。
+     * 若断网重试导致本函数被高频调用，这里能直接看出调用次数与耗时。 */
+    static uint32_t s_bg_gen_count;
+    ESP_LOGW(TAG, "bg_gen #%lu %dx%d took %ums (rgb %d,%d,%d -> %d,%d,%d)",
+             (unsigned long)++s_bg_gen_count, W, H,
+             (unsigned)(lv_tick_get() - s_bg_gen_t0_ms),
+             r_top, g_top, b_top, r_bot, g_bot, b_bot);
 }
 
 /* ====== 从封面 RGB565 像素提取主色并更新背景 ====== */
@@ -3153,7 +3210,14 @@ void lvgl_port_ui_lyrics_clear(void)
     if (s_lyrics_placeholder) lv_obj_clear_flag(s_lyrics_placeholder, LV_OBJ_FLAG_HIDDEN);
     ESP_LOGI(TAG, "Lyrics UI cleared");
 }
-/* ── 双线性预缩放到 UI_COVER_SIZE（严格重采样，保留备用） ── */
+
+/* ── 像素级双线性缩放：将任意尺寸封面在灌入 LVGL 前严格重采样为 UI_COVER_SIZE ──
+ * 对齐 gitee 参考实现 (esp_miplay)：把缩放从 LVGL 运行时搬到灌入前，
+ * 使 lv_img_set_zoom(LV_SCALE_NONE) 走快速拷贝路径。
+ * 原实现直接 memcpy 原始尺寸 + 运行时 zoom，会让 LVGL 对每个输出像素做
+ * 双线性插值 + alpha 混合（transformed 路径），单次重绘耗时接近 WDT 阈值；
+ * 投屏后 position 事件每秒触发一次重绘，累积超过 CONFIG_ESP_TASK_WDT_TIMEOUT_S
+ * 导致 task_wdt 复位（症状：投屏数秒后卡死重启、封面显示不出来）。 */
 static void _scale_rgb565_to_cover_buf(const uint16_t *src, int src_w, int src_h,
                                        uint16_t *dst, int dst_w, int dst_h)
 {
@@ -3195,33 +3259,38 @@ static void _scale_rgb565_to_cover_buf(const uint16_t *src, int src_w, int src_h
 
 void lvgl_port_ui_set_cover(const uint16_t *pixels, int w, int h) {
     if (!pixels || w <= 0 || h <= 0) return;
-    size_t px_size = w * h * sizeof(uint16_t);
-    if (px_size > sizeof(s_cover_buf)) {
-        ESP_LOGW(TAG, "Cover too large: %dx%d", w, h);
+
+    ESP_LOGI(TAG, "set_cover: %dx%d -> %dx%d", w, h, UI_COVER_SIZE, UI_COVER_SIZE);
+    /* 先在内存中严格重采样缩放到 UI_COVER_SIZE，杜绝运行时 scale
+     * （对齐 gitee：灌入前缩放到目标尺寸，运行时零缩放走快速路径）。
+     * s_cover_buf 容量按 LVGL_PORT_COVER_SRC_SIZE 定义，按需再校验。 */
+    if ((size_t)UI_COVER_SIZE * UI_COVER_SIZE > sizeof(s_cover_buf) / sizeof(uint16_t)) {
+        ESP_LOGW(TAG, "Cover buf too small for %d", UI_COVER_SIZE);
         return;
     }
+    _scale_rgb565_to_cover_buf(pixels, w, h, s_cover_buf, UI_COVER_SIZE, UI_COVER_SIZE);
+    _update_bg_from_cover(s_cover_buf, UI_COVER_SIZE, UI_COVER_SIZE);   /* 依据封面主色更新背景 */
 
-    ESP_LOGI(TAG, "set_cover: %dx%d", w, h);
-    memcpy(s_cover_buf, pixels, px_size);
-    _update_bg_from_cover(s_cover_buf, w, h);   /* 依据封面主色更新背景 */
-
+    const size_t px_size = (size_t)UI_COVER_SIZE * UI_COVER_SIZE * sizeof(uint16_t);
+    ESP_LOGW(TAG, "[DBG] set_cover: scaled %dx%d -> %dx%d px_size=%u core=%d",
+             w, h, UI_COVER_SIZE, UI_COVER_SIZE, (unsigned)px_size, xPortGetCoreID());
     lv_img_dsc_t *dsc = (lv_img_dsc_t *)lv_malloc(sizeof(lv_img_dsc_t));
     if (!dsc) return;
     memset(dsc, 0, sizeof(*dsc));
     dsc->header.magic = LV_IMAGE_HEADER_MAGIC;
     dsc->header.flags = 0;
-    dsc->header.w = w;
-    dsc->header.h = h;
-    dsc->header.stride = w * sizeof(uint16_t);
+    dsc->header.w = UI_COVER_SIZE;
+    dsc->header.h = UI_COVER_SIZE;
+    dsc->header.stride = UI_COVER_SIZE * sizeof(uint16_t);
     dsc->header.cf = LV_COLOR_FORMAT_RGB565;
     dsc->data_size = px_size;
     dsc->data = (const uint8_t *)s_cover_buf;
     lv_img_set_src(s_cover_img, dsc);
     lv_obj_invalidate(s_cover_img);
+    /* 1:1 无缩放摆正，容器内贴合 (0,0)，中心 pivot 严格对准 (74, 74) */
     lv_img_set_zoom(s_cover_img, LV_SCALE_NONE);
-    lv_img_set_pivot(s_cover_img, w / 2, h / 2);
-    lv_obj_set_pos(s_cover_img, (UI_COVER_SIZE - w) / 2,
-                   (UI_COVER_SIZE - h) / 2);
+    lv_img_set_pivot(s_cover_img, UI_COVER_SIZE / 2, UI_COVER_SIZE / 2);
+    lv_obj_set_pos(s_cover_img, 0, 0);
     lv_obj_clear_flag(s_cover_img, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(s_cover_container, LV_OBJ_FLAG_HIDDEN);
     s_cover_ready = true;   /* 封面就绪 */

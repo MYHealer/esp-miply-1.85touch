@@ -3,23 +3,45 @@ build/
 managed_components/
 dependencies.lock
 
+# ESP-IDF 生成物 / 配置备份
+# 根目录的 sdkconfig 由 sdkconfig.defaults 生成, 不入库(改配置请改 .defaults).
+# 用 / 锚定根目录, 避免误伤第三方组件内自带的 sdkconfig.defaults.
+/sdkconfig
+/sdkconfig.old
+/sdkconfig.bak
+/sdkconfig.bak.orig
+/toolchain/
+/dependencies.lock
+
 # Third-party components (install via idf.py add-dependency or git submodules)
-components/lvgl/
-components/esp-adf-libs/
-components/esp_codec_dev/
-components/libwebp/
-components/gmf_audio/
-components/gmf_core/
-components/gmf_io/
-components/gmf_loader/
-components/cmake_utilities/
-components/esp_lcd_st77916/
-components/wifi_provision/
-components/idf6_compat/
-components/nghttp/
-components/mrbgems/
-components/mruby/
-components/urlparse/
+# 注意: 本仓库为保证可独立编译, 已将全部第三方组件源码纳入版本控制,
+# 故此处不再忽略 components/ 下的第三方目录. 仅忽略预编译静态库与文档,
+# 它们是平台无关的二进制/说明文件, 可从上游重新获取, 且单文件常 >1MB.
+components/*/docs/
+components/*/*/docs/
+components/*/demos/
+components/*/*/demos/
+components/*/examples/
+components/*/*/examples/
+components/*/tests/
+components/*/*/tests/
+components/*/env_support/
+components/*/scripts/
+components/*/test_apps/
+components/*/*/test_apps/
+components/*/example/
+components/*/*/example/
+components/esp-adf-libs/*/lib/
+components/esp-adf-libs/*/*/lib/
+components/libwebp/**/lib/
+components/nghttp/**/lib/
+components/mrbgems/*/src/
+
+# 例外: 以下为项目自有/已集成的组件源码, 必须纳入版本控制
+# 保持可独立编译 (勿改为目录忽略)
+# 历史遗留的 components/idf6_compat/ 忽略规则已删除 —— 顶部 CMakeLists.txt
+# 在 IDF>=6 时硬引用 components/idf6_compat/idf6_compat.h 并 -include,
+# 忽略它会导致全新克隆无法编译.
 
 # Serial logs
 esp32_log.txt
@@ -54,19 +76,26 @@ font_chars.txt
 *.ttc
 *.otf
 
-# Large generated resource files (>1MB, regenerate with lv_font_conv / img converter)
-components/lvgl_port/ui_ref/lv_font_simsun_16_cjk.c
-components/lvgl_port/ui_ref/lv_font_simsun_16_supplement.c
-components/lvgl_port/ui_ref/ui_img_jiaopian_png.c
-components/lvgl_port/ui_img_jiaopian_png.c
+# ---------------------------------------------------------------------------
+# 大体积编译必需资源: 已入库(共 ~30 MB), 保证全新克隆可直接编译.
+# lvgl_port/CMakeLists.txt 的 SRCS 显式引用以下文件:
+#   components/lvgl_port/ui_ref/lv_font_simsun_16_cjk.c        (22.7 MB)
+#   components/lvgl_port/ui_ref/lv_font_simsun_16_supplement.c ( 6.3 MB)
+#   components/lvgl_port/ui_ref/ui_img_jiaopian_png.c          ( 1.6 MB)
+# 若要重新生成, 见 components/lvgl_port/ui_ref/filelist.txt
+# ---------------------------------------------------------------------------
+# ⚠ 勿在此处加上述三个路径的忽略规则 —— 会导致 lvgl_port 编译失败.
 
 # Zip files
 *.zip
 
 # Temporary extraction directories
 temp_extract_*/
-*.png
-*.svg
+
+# 注意: 本项目有大量编译必需的 .png/.svg 素材(经 LVGL 转换器转成 .c 入库),
+# 但源码树内也保留了原始 .png, 故此处不做全局忽略.
+# *.png
+# *.svg
 
 # Reference repos (cloned for protocol analysis)
 docs/reference/

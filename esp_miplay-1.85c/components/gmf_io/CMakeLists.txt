@@ -24,4 +24,4 @@ idf_component_register(SRCS ${io_srcs}
                        INCLUDE_DIRS ./include ${io_inc} "http_lib/gzip/" "http_lib/gzip/include"
                        PRIV_INCLUDE_DIRS ""
                        REQUIRES "driver" "esp_http_client" "esp_driver_i2s" "gmf_core" "esp_codec_dev" "i2s_pa" "esp_ringbuf"
-                       PRIV_REQUIRES mbedtls)
+                       PRIV_REQUIRES mbedtls esp-adf-libs)

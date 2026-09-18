@@ -1,0 +1,5 @@
+menu "Audio Codec Device Configuration"
+    config CODEC_ES8311_SUPPORT
+        bool "Support ES8311 Codec Chip"
+        default y
+endmenu

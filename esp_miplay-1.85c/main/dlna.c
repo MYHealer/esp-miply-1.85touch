@@ -178,9 +178,12 @@ static char          *s_playing_uri       = NULL; /* 当前音频管道实际加
 static int             s_near_end_count    = 0;   /* 连续接近曲末的 tick 数 */
 static volatile int    s_media_generation  = 0;   /* 媒体代数：每次新 URI +1，异步任务校验 */
 static volatile int   s_album_art_gen = 0;  /* 封面任务代次，切歌时递增取消旧任务 */
-/* 封面 worker 任务：队列驱动 + PSRAM 栈（避免内部 SRAM 碎片导致任务创建失败） */
+/* 封面 worker 任务：队列驱动 + PSRAM 栈（避免内部 SRAM 碎片导致任务创建失败）。
+ * ★ 对齐参考工程 esp_miplay-main/dlna.c:154 的 80KB。原为 256KB（3.2 倍虚开）：
+ *   同一条封面解码路径（lodepng/zlib inflate）在参考工程 80KB 下可跑通，
+ *   256KB 只是推高创建时的 memset 开销并占用 PSRAM cache 映射，无实际收益。 */
 #define ALBUM_ART_QUEUE_LEN 1
-#define ALBUM_ART_TASK_STACK_BYTES      (256U * 1024U)
+#define ALBUM_ART_TASK_STACK_BYTES      (80U * 1024U)
 #define DLNA_DELAYED_STOP_STACK_BYTES   (12U * 1024U)
 #define DLNA_UI_UPDATE_STACK_BYTES      (24U * 1024U)
 static QueueHandle_t  s_album_art_queue = NULL;
@@ -2568,6 +2571,16 @@ static void ui_update_task(void *arg)
 
         lvgl_port_lock();
 
+        /* [DBG] 内存水位：每 5s 一次。投屏崩溃若与 PSRAM/内部堆耗尽相关，
+         * 这里能看到崩前趋势（internal 碎片化时 largest 会远小于 free）。 */
+        if ((tick % 125) == 0) {
+            ESP_LOGW(TAG, "[DBG] mem: int_free=%u int_largest=%u psram_free=%u psram_largest=%u",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+        }
+
         /* MiPlay 网络任务只投递事件，所有 LVGL 和歌词操作在本任务串行执行。 */
         consume_miplay_media_events_locked();
 
@@ -2761,6 +2774,51 @@ static void ui_update_task(void *arg)
 static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 
+/* 断连重连退避：未配网设备连不上会陷入「断连→立即重连→驱动停在 CONNECTING」
+ * 的死循环，而 esp_wifi_scan_start() 与连接互斥（驱动报
+ * "sta is connecting, return error"），导致配网页扫描永远 No networks found。
+ * 退避用 esp_timer_start_once()：回调运行在独立定时器任务，
+ * 用 vTaskDelay() 会阻塞整个 esp_event 事件循环。
+ * 0.5s 起 ×2 递增，5s 封顶。 */
+#define WIFI_RETRY_BASE_MS   500
+#define WIFI_RETRY_MAX_MS    5000
+static esp_timer_handle_t s_wifi_retry_timer = NULL;
+static int                s_wifi_retry_ms      = WIFI_RETRY_BASE_MS;
+
+static void wifi_retry_cb(void *arg)
+{
+    (void)arg;
+    /* 退避期间可能已进入配网模式或已连上，此处需复核 */
+    if (wifi_provision_is_running()) return;
+    if (xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) return;
+    esp_wifi_connect();
+}
+
+static void wifi_retry_schedule(void)
+{
+    if (!s_wifi_retry_timer) {
+        const esp_timer_create_args_t args = {
+            .callback = wifi_retry_cb,
+            .name     = "wifi_retry",
+        };
+        if (esp_timer_create(&args, &s_wifi_retry_timer) != ESP_OK) {
+            ESP_LOGE(TAG, "wifi_retry timer create failed");
+            return;
+        }
+    }
+    /* 等价于「重建」：先停掉可能待触发的旧请求，避免重连风暴 */
+    (void)esp_timer_stop(s_wifi_retry_timer);
+    if (esp_timer_start_once(s_wifi_retry_timer,
+                             (uint64_t)s_wifi_retry_ms * 1000ULL) != ESP_OK) {
+        ESP_LOGW(TAG, "wifi_retry start failed");
+        return;
+    }
+    ESP_LOGI(TAG, "WiFi retry in %d ms", s_wifi_retry_ms);
+    /* 指数退避封顶 */
+    s_wifi_retry_ms *= 2;
+    if (s_wifi_retry_ms > WIFI_RETRY_MAX_MS) s_wifi_retry_ms = WIFI_RETRY_MAX_MS;
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
@@ -2778,15 +2836,22 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             s_user_stopped = 0;  /* 标记为非用户主动暂停 */
             s_stuck_paused_since = esp_timer_get_time();
         }
-        if (wifi_provision_is_running() &&
-            wifi_provision_get_status() == WIFI_PROVISION_STATUS_CONNECTING) {
+        /* 配网运行期间一律不自动重连——否则 STA 常驻 CONNECTING 会让
+         * 配网页的 esp_wifi_scan_start() 全部被驱动拒绝。
+         * 判据只要求「配网已启动」：wifi_provision_start() 把状态置为 IDLE
+         * 而非 CONNECTING，若把 CONNECTING 也作为条件会覆盖不到
+         * 「配网已起、用户尚未点连接」这段窗口。 */
+        if (wifi_provision_is_running()) {
+            ESP_LOGI(TAG, "Provisioning active, skip auto-reconnect");
             return;
         }
-        esp_wifi_connect();
+        wifi_retry_schedule();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "WiFi connected, IP: " IPSTR, IP2STR(&event->ip_info.ip));
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        /* 连上了就重置退避，下次断连从 0.5s 重新开始 */
+        s_wifi_retry_ms = WIFI_RETRY_BASE_MS;
         /* 拿到 IP 后启动 SNTP 同步（内部幂等，重连不会重复创建） */
         sntp_time_start();
         /* WiFi 恢复后自动恢复播放 */
@@ -2884,6 +2949,8 @@ static void mdns_service_init(void)
 /* MiPlay 连接状态回调：暂停/恢复 DLNA SSDP + 停止音频管线 */
 static void dlna_on_miplay_connected(bool connected)
 {
+    ESP_LOGW(TAG, "[DBG] miplay_connected_cb: connected=%d (was=%d) core=%d",
+             (int)connected, (int)s_miplay_connected, xPortGetCoreID());
     s_miplay_connected = connected;
     s_miplay_state = PS_STOPPED;
     s_miplay_position_ms = 0;

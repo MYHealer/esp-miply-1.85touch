@@ -34,6 +34,28 @@ Thumbs.db
 # Reference projects (not part of the project)
 参考项目/
 
+# ---------------------------------------------------------------------------
+# 顶层为 1.85c 的父版本(旧)工程快照, 不含本次修复. 仓库只跟踪 esp_miplay-1.85c/,
+# 以下规则把顶层那套旧工程整体排除, 避免仓库内出现两套 dlna 工程.
+# 注意: git 无法忽略"已跟踪"文件, 这些路径必须先 git rm --cached.
+# ---------------------------------------------------------------------------
+/components/
+/main/
+/managed_components/
+/build/
+/CMakeLists.txt
+/sdkconfig
+/sdkconfig.defaults
+/sdkconfig.defaults.esp32s3
+/partitions_dlna_example.csv
+/dependencies.lock
+/README.md
+/logo.png
+
+# 会话临时文件
+.commit_msg.txt
+cap_fix.py
+
 # Node modules (font converter)
 node_modules/
 

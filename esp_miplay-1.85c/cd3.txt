@@ -1,0 +1,259 @@
+﻿espcoredump.py v1.16.0
+===============================================================
+==================== ESP32 CORE DUMP START ====================
+The ROM ELF file won't be loaded automatically since you are running the utility out of IDF.
+
+Crashed task handle: 0x3fce33e4, name: '', GDB name: 'process 1070478308'
+Crashed task is not in the interrupt context
+Panic reason: Task watchdog got triggered. The following tasks/users did not reset the watchdog in time:
+ - IDLE0 (CPU 0)
+
+================== CURRENT THREAD REGISTERS ===================
+exccause       0x0 (IllegalInstructionCause)
+excvaddr       0x3c207f70
+epc1           0x40044290
+epc2           0x0
+epc3           0x0
+epc4           0x0
+epc5           0x0
+epc6           0x0
+eps2           0x0
+eps3           0x0
+eps4           0x0
+eps5           0x0
+eps6           0x0
+
+
+==================== CURRENT THREAD STACK =====================
+pc             0x420a2c74          0x420a2c74 <img_draw_core+712>
+lbeg           0x4217e188          1108861320
+lend           0x4217e194          1108861332
+lcount         0x0                 0
+sar            0x1a                26
+ps             0x60e20             396832
+threadptr      <unavailable>
+br             <unavailable>
+scompare1      <unavailable>
+acclo          <unavailable>
+acchi          <unavailable>
+m0             <unavailable>
+m1             <unavailable>
+m2             <unavailable>
+m3             <unavailable>
+fcr            <unavailable>
+fsr            <unavailable>
+pwrctl         <unavailable>
+pwrstat        <unavailable>
+eristat        <unavailable>
+cs_itctrl      <unavailable>
+cs_claimset    <unavailable>
+cs_claimclr    <unavailable>
+cs_lockaccess  <unavailable>
+cs_lockstatus  <unavailable>
+cs_authstatus  <unavailable>
+fault_info     <unavailable>
+trax_id        <unavailable>
+trax_control   <unavailable>
+trax_status    <unavailable>
+trax_data      <unavailable>
+trax_address   <unavailable>
+trax_pctrigger <unavailable>
+trax_pcmatch   <unavailable>
+trax_delay     <unavailable>
+trax_memstart  <unavailable>
+trax_memend    <unavailable>
+pmg            <unavailable>
+pmpc           <unavailable>
+pm0            <unavailable>
+pm1            <unavailable>
+pmctrl0        <unavailable>
+pmctrl1        <unavailable>
+pmstat0        <unavailable>
+pmstat1        <unavailable>
+ocdid          <unavailable>
+ocd_dcrclr     <unavailable>
+ocd_dcrset     <unavailable>
+ocd_dsr        <unavailable>
+a0             0x8209f378          -2113277064
+a1             0x3fce2640          1070474816
+a2             0x3fca8834          1070237748
+a3             0x3fcb0ed4          1070272212
+a4             0x168               360
+a5             0x24c               588
+a6             0x2b                43
+a7             0x10                16
+a8             0x0                 0
+a9             0x3fce2620          1070474784
+a10            0x0                 0
+a11            0x0                 0
+a12            0x3fce26c8          1070474952
+a13            0x198               408
+a14            0x3fce27e0          1070475232
+a15            0x3fce27e0          1070475232
+
+======================== THREADS INFO =========================
+#0  0x420a2c74 in img_draw_core (draw_unit=0x3fca8834 <work_mem_int+3224>, draw_dsc=0x3fcb0ed4 <work_mem_int+37688>, decoder_dsc=<optimized out>, sup=0x3fce2790, img_coords=0x3fcb0fc4 <work_mem_int+37928>, clipped_img_area=<optimized out>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/sw/lv_draw_sw_img.c:322
+#1  0x4209f378 in img_decode_and_draw (draw_unit=0x3fca8834 <work_mem_int+3224>, draw_dsc=0x3fcb0ed4 <work_mem_int+37688>, decoder_dsc=0x3fce27e0, relative_decoded_area=0x0, img_area=0x3fcb0fc4 <work_mem_int+37928>, clipped_img_area=0x3fce282c, draw_core_cb=draw_core_cb@entry=0x420a29ac <img_draw_core>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/lv_draw_image.c:285
+#2  0x4209f7db in lv_draw_image_normal_helper (draw_unit=0x3fca8834 <work_mem_int+3224>, draw_dsc=0x3fcb0ed4 <work_mem_int+37688>, coords=0x3fcb0fc4 <work_mem_int+37928>, draw_core_cb=0x420a29ac <img_draw_core>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/lv_draw_image.c:178
+#3  0x420a304c in lv_draw_sw_image (draw_unit=0x3fca8834 <work_mem_int+3224>, draw_dsc=0x3fcb0ed4 <work_mem_int+37688>, coords=0x3fcb0fc4 <work_mem_int+37928>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/sw/lv_draw_sw_img.c:169
+#4  lv_draw_sw_image (draw_unit=0x3fca8834 <work_mem_int+3224>, draw_dsc=0x3fcb0ed4 <work_mem_int+37688>, coords=0x3fcb0fc4 <work_mem_int+37928>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/sw/lv_draw_sw_img.c:165
+#5  0x420a094d in execute_drawing (u=0x3fca8834 <work_mem_int+3224>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/sw/lv_draw_sw.c:518
+#6  execute_drawing_unit (u=0x3fca8834 <work_mem_int+3224>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/sw/lv_draw_sw.c:383
+#7  dispatch (draw_unit=0x3fca8834 <work_mem_int+3224>, layer=0x3fcb0e84 <work_mem_int+37608>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/sw/lv_draw_sw.c:463
+#8  dispatch (draw_unit=0x3fca8834 <work_mem_int+3224>, layer=0x3fcb0e84 <work_mem_int+37608>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/sw/lv_draw_sw.c:430
+#9  0x4209e9ae in lv_draw_dispatch_layer (disp=<optimized out>, layer=0x3fcb0e84 <work_mem_int+37608>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/lv_draw.c:276
+#10 0x4209e9f5 in lv_draw_dispatch () at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/lv_draw.c:182
+#11 0x4209ea4e in lv_draw_finalize_task_creation (layer=<optimized out>, t=0x3fcb0fbc <work_mem_int+37920>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/lv_draw.c:147
+#12 0x4209f730 in lv_draw_image (layer=0x3fcb0e84 <work_mem_int+37608>, dsc=0x3fce2960, coords=0x3fce29cc) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/draw/lv_draw_image.c:122
+#13 0x420b872c in draw_image (e=<optimized out>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/widgets/image/lv_image.c:794
+#14 lv_image_event (class_p=<optimized out>, e=<optimized out>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/widgets/image/lv_image.c:684
+#15 0x4217bec4 in lv_obj_event_base (class_p=0x0, e=0x3fce2a60) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_obj_event.c:89
+#16 0x42098c61 in event_send_core (e=0x3fce2a60) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_obj_event.c:364
+#17 0x42098cef in lv_obj_send_event (obj=<optimized out>, event_code=LV_EVENT_DRAW_MAIN, param=0x3fcb0e84 <work_mem_int+37608>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_obj_event.c:67
+#18 0x4209ce84 in lv_obj_redraw (layer=0x3fcb0e84 <work_mem_int+37608>, obj=0x3fca9cc0 <work_mem_int+8484>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:116
+#19 0x4209d16a in refr_obj (layer=0x3fcb0e84 <work_mem_int+37608>, obj=0x3fca9cc0 <work_mem_int+8484>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:1032
+#20 refr_obj (layer=0x3fcb0e84 <work_mem_int+37608>, obj=0x3fca9cc0 <work_mem_int+8484>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:1015
+#21 0x4209d08f in lv_obj_redraw (layer=0x3fca8c54 <work_mem_int+4280>, obj=0x3fca9c1c <work_mem_int+8320>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:218
+#22 0x4209d16a in refr_obj (layer=0x3fca8c54 <work_mem_int+4280>, obj=0x3fca9c1c <work_mem_int+8320>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:1032
+#23 refr_obj (layer=0x3fca8c54 <work_mem_int+4280>, obj=0x3fca9c1c <work_mem_int+8320>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:1015
+#24 0x4209cf41 in lv_obj_redraw (layer=0x3fca8c54 <work_mem_int+4280>, obj=0x3fca9814 <work_mem_int+7288>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:167
+#25 0x4209d16a in refr_obj (layer=0x3fca8c54 <work_mem_int+4280>, obj=0x3fca9814 <work_mem_int+7288>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:1032
+#26 refr_obj (layer=0x3fca8c54 <work_mem_int+4280>, obj=0x3fca9814 <work_mem_int+7288>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:1015
+#27 0x4209d4e6 in refr_obj_and_children (layer=0x3fca8c54 <work_mem_int+4280>, top_obj=<optimized out>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:820
+#28 0x4209d628 in refr_area_part (layer=0x3fca8c54 <work_mem_int+4280>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:753
+#29 0x4209de61 in refr_area (area_p=<optimized out>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:679
+#30 refr_invalid_areas () at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:586
+#31 lv_display_refr_timer (tmr=<optimized out>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/core/lv_refr.c:398
+#32 0x420af7bd in lv_timer_exec (timer=0x3fca8ca4 <work_mem_int+4360>) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/misc/lv_timer.c:326
+#33 lv_timer_handler () at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/misc/lv_timer.c:107
+#34 lv_timer_handler () at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl/src/misc/lv_timer.c:63
+#35 0x4208feef in lvgl_tick_task (arg=0x0) at E:/ESP/esp-miply-1.85touch/esp_miplay-1.85c/components/lvgl_port/lvgl_port_disp.c:57
+#36 0x40381948 in vPortTaskWrapper (pxCode=0x4208fee0 <lvgl_tick_task>, pvParameters=0x0) at E:/ESP/.espressif/v5.5.4/esp-idf/components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c:139
+Retrying reading threads information...
+
+
+       TCB             NAME PRIO C/B  STACK USED/FREE
+---------- ---------------- -------- ----------------
+0x3fce33e4                 1070445536/5          72/3664
+0x3fce94c0                 1016561248/5   53679780/10656
+0x3fcd689c                 1016019636/4    54394400/1168
+0x3fca6f70                 1015997096/4     54230276/576
+0x3fcd7600                 1016099776/4     54313604/688
+0x3fce7a80                 1016536668/3     53935204/784
+0x3fce6fa4                 1016506816/3    53974568/1616
+0x3fce791c                 1016524376/3    53959424/1680
+0x3fce71c4                 1016519108/3    53969976/2720
+0x3fcb8300                 1015635980/1     54661940/704
+0x3fcbe6cc                 1070325960/0           64/640
+0x3fcbee34                 1070327856/0           72/640
+0x3fcdb020                 1070432284/6           68/768
+0x3fceb204                 1070507008/18           72/752
+0x3fcbc8e8                 1017292924/8    52895916/1296
+0x3fcbbe88                 1017178568/4    53089532/2320
+0x3fcbc574                 1017231828/3    53074904/2112
+
+==================== THREAD 1 (TCB: 0x3fce33e4, name: '') =====================
+
+
+==================== THREAD 2 (TCB: 0x3fce94c0, name: '') =====================
+
+
+==================== THREAD 3 (TCB: 0x3fcd689c, name: '') =====================
+
+
+==================== THREAD 4 (TCB: 0x3fca6f70, name: '') =====================
+
+
+==================== THREAD 5 (TCB: 0x3fcd7600, name: '') =====================
+
+
+==================== THREAD 6 (TCB: 0x3fce7a80, name: '') =====================
+
+
+==================== THREAD 7 (TCB: 0x3fce6fa4, name: '') =====================
+
+
+==================== THREAD 8 (TCB: 0x3fce791c, name: '') =====================
+
+
+==================== THREAD 9 (TCB: 0x3fce71c4, name: '') =====================
+
+
+==================== THREAD 10 (TCB: 0x3fcb8300, name: '') =====================
+
+
+==================== THREAD 11 (TCB: 0x3fcbe6cc, name: '') =====================
+
+
+==================== THREAD 12 (TCB: 0x3fcbee34, name: '') =====================
+
+
+==================== THREAD 13 (TCB: 0x3fcdb020, name: '') =====================
+
+
+==================== THREAD 14 (TCB: 0x3fceb204, name: '') =====================
+
+
+==================== THREAD 15 (TCB: 0x3fcbc8e8, name: '') =====================
+
+
+==================== THREAD 16 (TCB: 0x3fcbbe88, name: '') =====================
+
+
+==================== THREAD 17 (TCB: 0x3fcbc574, name: '') =====================
+
+
+
+======================= ALL MEMORY REGIONS ========================
+Name   Address   Size   Attrs
+.rtc.text 0x600fe000 0x0 RW  
+.rtc.force_fast 0x600fe000 0x0 RW  
+.rtc_noinit 0x50000000 0x0 RW  
+.rtc.force_slow 0x50000000 0x20 RW A
+.iram0.vectors 0x40374000 0x404 R XA
+.iram0.text 0x40374404 0x1b463 R XA
+.dram0.data 0x3fc9f900 0x6330 RW A
+.flash.text 0x42000020 0x18b9b8 R XA
+.flash.appdesc 0x3c190020 0x100 R  A
+.flash.rodata 0x3c190120 0x5cbb80 RW A
+.iram0.data 0x4038f900 0x0 RW  
+.iram0.bss 0x4038f900 0x0 RW  
+.dram0.heap_start 0x3fcb9290 0x0 RW  
+.coredump.tasks.data 0x3fce33e4 0x154 RW 
+.coredump.tasks.data 0x3fce2580 0xe50 RW 
+.coredump.tasks.data 0x3fce94c0 0x154 RW 
+.coredump.tasks.data 0x3c9b54b0 0x29a0 RW 
+.coredump.tasks.data 0x3fcd689c 0x154 RW 
+.coredump.tasks.data 0x3c8f6620 0x490 RW 
+.coredump.tasks.data 0x3fca6f70 0x154 RW 
+.coredump.tasks.data 0x3c8ef060 0x240 RW 
+.coredump.tasks.data 0x3fcd7600 0x154 RW 
+.coredump.tasks.data 0x3c90b100 0x2b0 RW 
+.coredump.tasks.data 0x3fce7a80 0x154 RW 
+.coredump.tasks.data 0x3c977b40 0x310 RW 
+.coredump.tasks.data 0x3fce6fa4 0x154 RW 
+.coredump.tasks.data 0x3c96d360 0x650 RW 
+.coredump.tasks.data 0x3fce791c 0x154 RW 
+.coredump.tasks.data 0x3c9717c0 0x690 RW 
+.coredump.tasks.data 0x3fce71c4 0x154 RW 
+.coredump.tasks.data 0x3c96e320 0xaa0 RW 
+.coredump.tasks.data 0x3fcb8300 0x154 RW 
+.coredump.tasks.data 0x3c896d40 0x2c0 RW 
+.coredump.tasks.data 0x3fcbe6cc 0x154 RW 
+.coredump.tasks.data 0x3fcbe440 0x280 RW 
+.coredump.tasks.data 0x3fcbee34 0x154 RW 
+.coredump.tasks.data 0x3fcbeba0 0x280 RW 
+.coredump.tasks.data 0x3fcdb020 0x154 RW 
+.coredump.tasks.data 0x3fcdad10 0x300 RW 
+.coredump.tasks.data 0x3fceb204 0x154 RW 
+.coredump.tasks.data 0x3fceaf00 0x2f0 RW 
+.coredump.tasks.data 0x3fcbc8e8 0x154 RW 
+.coredump.tasks.data 0x3ca4a360 0x510 RW 
+.coredump.tasks.data 0x3fcbbe88 0x154 RW 
+.coredump.tasks.data 0x3ca1a0b0 0x910 RW 
+.coredump.tasks.data 0x3fcbc574 0x154 RW 
+.coredump.tasks.data 0x3ca1e190 0x840 RW 
+
+===================== ESP32 CORE DUMP END =====================
+===============================================================
+Done!
