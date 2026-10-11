@@ -678,7 +678,7 @@ void tft_ui_init_screen(void)
     tft_draw_hline(UI_MARGIN, UI_BAR_Y, TFT_W - UI_MARGIN * 2, COLOR_DARK_GRAY);
 
     /* 初始文字 */
-    tft_draw_string(UI_MARGIN, UI_META_Y, "DLNA Player", COLOR_META_TITLE, COLOR_BG, 1);
+    tft_draw_string(UI_MARGIN, UI_META_Y, "Xiaomi Speaker", COLOR_META_TITLE, COLOR_BG, 1);
     tft_draw_string(UI_MARGIN, UI_META_SUB_Y, "Waiting...", COLOR_META_SUB, COLOR_BG, 1);
 
     memset(&s_prev, 0, sizeof(s_prev));

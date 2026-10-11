@@ -1,7 +1,8 @@
-# ESP32-S3-Touch-LCD-1.85C — MiPlay / DLNA 投屏播放器
+# ESP32-S3-Touch-LCD-1.85C — 基于小米妙播协议的原生小米音箱
 
-> 基于 ESP-GMF 的 WiFi 音频投屏渲染器，运行在 **ESP32-S3-Touch-LCD-1.85C 一体化开发板**上。
-> 支持 MiPlay（小米妙播）、DLNA 投屏，1.85 寸 360×360 圆形 QSPI 屏显示唱片动画与歌词，电容触摸 + 手机遥控双向控制。
+> 在 **ESP32-S3-Touch-LCD-1.85C 一体化开发板**上实现的原生小米音箱：协议级对接
+> **小米妙播（MiPlay）**，可被手机控制中心直接发现与投屏，支持反向控制。
+> 同时兼容 DLNA 投屏。1.85 寸 360×360 圆形 QSPI 屏显示唱片动画与歌词，电容触摸 + 手机遥控双向控制。
 
 **当前版本：v1.5.0**
 
@@ -39,9 +40,9 @@
 ## 功能
 
 ### 投屏协议
-- ✅ **MiPlay（小米妙播）** — 协议级对接，支持反向控制（手机端播放/暂停/切歌/Seek/音量同步到设备）
+- ✅ **MiPlay（小米妙播）** — 协议级对接：mDNS 双服务发现 + TCP 8899 加密帧 + 反向控制（[详见核心协议](#小米妙播miplay)）
+- ✅ **airkan 遥控** — 小米妙享遥控器方向键 Seek、OK 键播放暂停、关机键切回屏保（[详见核心协议](#小米-airkan-遥控)）
 - ✅ **DLNA** — 网易云/QQ音乐/酷狗等 DLNA App 投屏
-- ✅ **airkan 遥控** — 小米妙享遥控器方向键 Seek、OK 键播放暂停、关机键切回屏保
 - ✅ **GENA 事件同步** — 手机端实时显示播放状态，歌曲自动切换
 
 ### 音频
@@ -177,6 +178,131 @@ idf.py -p COM35 flash
 | 手机遥控关机键 | 进入/退出屏保 |
 | 无操作 2 分钟 | 进入锁屏时钟（非播放态） |
 | 触摸锁屏画面 | 立即解锁 |
+
+## 核心协议
+
+本项目最核心的部分不是音频播放（那是 ESP-GMF 的功劳），而是**让手机把它当作一台原生小米音箱**。
+这由两个小米私有协议共同实现：**小米妙播（MiPlay）**负责发现与推流，**airkan 遥控**负责遥控器按键。
+
+### 小米妙播（MiPlay）
+
+MiPlay 是小米的局域网投屏协议，手机下拉控制中心的「妙播」列表就是靠它发现设备。
+
+**① 服务发现（mDNS）**
+
+注册两个服务，缺一不可：
+
+| 服务 | 类型 | 作用 |
+|------|------|------|
+| `_mi-connect._udp` | TXT 广播 | 让手机知道「这里有一台可投屏设备」 |
+| `_lyra-mdns._udp` | TXT 广播 | 携带 Lyra 能力位与 AppData，决定设备出现在哪个 picker |
+
+TXT 里有两个**不能自作聪明改**的字段：
+
+- `appsdata` 固定为 base64 `gQAEBIMiww==`（解码 `81 00 04 04 83 22 C3`，其中 `0x0483` 是 Lyra 能力位入口、`0x22C3`=8899 是控制端口）。
+  用 PC 端自算的描述符会导致 HyperOS 置 `hasLyraBymiplay=true`，**反而把接收端拒绝加入音频 picker**。
+- `AppData` 二进制里设备类型字节是 `0x03`（TV）而不是 PC 的 `0x15`。
+  实测只有以 TV 身份出现，手机的遥控面板才会打开（见下文 airkan）。
+
+**② 控制通道（TCP 8899）**
+
+手机连上 8899 后，所有控制走**加密二进制帧**：
+
+```
+[magic 0x24][... header ...][cmd:2B][seq:2B][payload]
+      └─ payload 用 SafetyData v1 封装：AES-128-CBC + CRC32(MPEG2) 完整性校验
+```
+
+- **帧魔数 `0x24`（`'$'`）**：解析时先按它同步。陷阱是歌词/封面/密文里也大量出现 `'$'`，
+  所以不能只看首字节，还要校验后续头部是否像 ASCII 文本才能确认是控制帧。
+- **加密**：`SafetyData v1`，固定 `AES_BLOCK_LEN 16`，CRC32 多项式 `0x04C11DB7`。
+  密钥来自手机下发的 safety challenge 交换，没有它连不上媒体通道。
+- **命令表**（节选，完整 22 条已全部实现）：
+
+| 方向 | 命令 | 值 | 说明 |
+|------|------|-----|------|
+| 手机→设备 | `CMD_OPEN_DEVICE` | `0x0000` | 打开设备会话 |
+| 手机→设备 | `CMD_PAUSE` / `CMD_RESUME` | `0x0004` / `0x0006` | 暂停 / 继续 |
+| 手机→设备 | `CMD_SET_VOLUME` / `CMD_GET_VOLUME` | `0x000C` / `0x000E` | 音量 |
+| 手机→设备 | `CMD_GET_MEDIA_INFO` | `0x0014` | 拉取媒体信息（封面/标题） |
+| 手机→设备 | `CMD_SET_PLAY_SOURCE` | `0x0040` | 注册播放源（推流前必做） |
+| 手机→设备 | `CMD_HEARTBEAT` | `0x001A` | 心跳保活 |
+| 手机→设备 | `CMD_SAFETY_*` | `0x0028`/`0x1400` | 密钥协商与鉴权 |
+| 设备→手机 | `CMD_NOTIFY` | `0x0022` | **反向控制**（见下） |
+
+**③ 反向控制（设备的遥控器按钮 → 手机）**
+
+这是「原生音箱」体验的关键：设备端按暂停，手机也要跟着暂停。统一用 `CMD_NOTIFY (0x0022)`
+发二进制 TLV：
+
+```
+[key_len:1B][key_bytes][value_type:1B][value_data]
+```
+
+| 动作 | key | value_type | 说明 |
+|------|-----|-----------|------|
+| 暂停/继续 | `key-pause` / `key-resume` | `0x00` (bool) | 值恒为 `0x01` |
+| 上/下一曲 | `key-prev` / `key-next` | `0x00` (bool) | |
+| Seek | `key-seek` | `0x09` | 8 字节大端毫秒 |
+| 音量同步 | `volume`（**无 `key-` 前缀**） | `0x07` | 4 字节大端百分比 |
+
+⚠️ 两个坑：
+- `0x0004`/`0x0006` 只用于**手机→设备**方向，设备回控必须用 `0x0022` NOTIFY，方向写反手机无响应。
+- 音量回控的键名是裸的 `volume`，不是 `key-volume`——与 `SetVolume` 之后的 sender-volume 通知字节格式保持一致。
+- HyperOS 收到 `key-pause`/`key-resume` 后**不保证回显状态**，所以设备端在发包成功后要立即本地投影新状态，
+  否则下一次 toggle 和 `GET_STATE` 会读到陈旧状态（表现为按两下才生效）。
+
+### 小米 airkan 遥控
+
+airkan（杜坎 `airkan_sdk`）是小米设备互联的**遥控器按键通道**。手机把设备识别为 TV 后，
+遥控面板的方向键/OK 键/电源键就是走这条通道，**不走 MiPlay 的 8899**。
+
+**① 两个端口，角色不同（别混）**
+
+| 端口 | 协议 | 作用 |
+|------|------|------|
+| **6095** | HTTP | 认证入口（`getInfo` / `requestAuth` / `completeAuth` / `cancelAuth`） |
+| **6091** | TCP | 遥控按键长连接（真正收按键帧的地方） |
+
+6091 这个端口是被反复猜错后才锁定的。证据链（HyperAll 反编译）：
+
+```
+AirkanService.java:1010  P(new f(this, h.IP, str), 2)
+  → :1272  构造函数 f(...) { this(hVar, 6091, ...); }
+  → :420   this.A.f(fVar.f6142d, fVar.f6141c)   (ip, port)
+  → remote/i.java:76   f(String ip, int port) → RCClientThreadV2.connect
+  → RCClientThreadV2.java:341  socketChannel.connect(new InetSocketAddress(mIp, mPort))
+```
+
+> 早期在 6094–6100 里试探，**恰好全部避开了 6091**，所以按键永远收不到。保留 6090/6092 作兜底。
+
+**② 版本号门槛**
+
+认证时上报的版本必须 **`> 0x01000000`**，本设备报 `0x01000008`。手机侧 `onVersionResponse`
+用它判断「设备是否支持遥控」：报 `1` 时手机只会反复 `getInfo`（每次按键重探），永不推进——低版本被当成「不支持」。
+
+**③ 按键帧结构**
+
+```
+[type:1B][len:2B BE]                        ← RCHeader
+[code:1B][id:4B BE][data_len:2B BE]         ← SendKeyHeader
+[subcode:1B][value:4B or 8B]...             ← TLV
+```
+
+TLV 里 `subcode 2 = action`（`0=down`, `1=up`）、`subcode 3 = keyCode`。本设备认的 keyCode：
+
+| keyCode | 按键 | 动作 |
+|---------|------|------|
+| 19 / 20 | next / prev | 上/下一曲 |
+| 21 / 22 | LEFT / RIGHT | Seek ∓15s |
+| 23 / 66 | DPAD_CENTER / ENTER | 播放暂停 toggle |
+| 24 / 25 | VOL+ / VOL- | 音量 ±5 |
+| 26 | POWER | 进入/退出屏保 |
+
+**④ 两个实现要点**
+
+- **静默失败**：airkan 连接失败时不重试、不报错，所以只能靠日志判断走到了哪一步。一旦没连上，现象是「遥控器和手机的连接显示正常，但按键毫无反应」。
+- **OK 键消抖**：手机按一次 OK 会连发多帧 `action=0`，本设备做 300ms 窗口去重，否则一按跳两次。
 
 ## 技术架构
 

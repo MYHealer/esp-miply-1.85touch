@@ -2432,7 +2432,7 @@ void lvgl_port_ui_create(void)
     s_label_title = lv_label_create(scr);
     lv_obj_set_pos(s_label_title, UI_SAFE_X, 220);
     lv_obj_set_width(s_label_title, UI_SAFE_W);
-    lv_label_set_text(s_label_title, "DLNA Player");
+    lv_label_set_text(s_label_title, "Xiaomi Speaker");
     lv_obj_set_style_text_color(s_label_title, C_WHITE, 0);
     lv_obj_set_style_text_font(s_label_title, &s_cjk_font, 0);
     lv_label_set_long_mode(s_label_title, LV_LABEL_LONG_SCROLL_CIRCULAR);
@@ -2570,8 +2570,8 @@ void lvgl_port_ui_lyrics_create(void)
     lv_obj_set_pos(s_lyrics_label_title, UI_CENTER_X - 110, 26);
     lv_obj_set_width(s_lyrics_label_title, 220);
     lv_obj_set_style_pad_all(s_lyrics_label_title, 0, 0);
-    const char *init_title = s_label_title ? lv_label_get_text(s_label_title) : "DLNA Player";
-    lv_label_set_text(s_lyrics_label_title, init_title ? init_title : "DLNA Player");
+    const char *init_title = s_label_title ? lv_label_get_text(s_label_title) : "Xiaomi Speaker";
+    lv_label_set_text(s_lyrics_label_title, init_title ? init_title : "Xiaomi Speaker");
     lv_obj_set_style_text_color(s_lyrics_label_title, C_WHITE80, 0);
     lv_obj_set_style_text_font(s_lyrics_label_title, &s_cjk_font, 0);
     lv_label_set_long_mode(s_lyrics_label_title, LV_LABEL_LONG_SCROLL_CIRCULAR);
@@ -2691,7 +2691,7 @@ bool lvgl_port_ui_lyrics_is_visible(void)
 
 /* ====== UI 更新 ====== */
 void lvgl_port_ui_set_title(const char *title) {
-    const char *text = title ? title : "DLNA Player";
+    const char *text = title ? title : "Xiaomi Speaker";
     lv_label_set_text(s_label_title, text);
     if (s_lyrics_label_title) {
         lv_label_set_text(s_lyrics_label_title, text);
@@ -3339,7 +3339,7 @@ void lvgl_port_ui_set_speaker_mode(bool active)
         ESP_LOGI(TAG, "Speaker mode UI: takeover screen shown");
     } else {
         /* 恢复默认 */
-        lv_label_set_text(s_label_title, "DLNA Player");
+        lv_label_set_text(s_label_title, "Xiaomi Speaker");
         lv_label_set_text(s_label_artist, "Waiting...");
         /* 恢复黑胶底盘与封面容器（如果有封面数据会自动更新） */
         if (s_disc_img) lv_obj_clear_flag(s_disc_img, LV_OBJ_FLAG_HIDDEN);

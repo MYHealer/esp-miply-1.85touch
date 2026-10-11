@@ -744,7 +744,7 @@ static void reset_miplay_media_locked(void)
     lyrics_clear();
     lvgl_port_ui_lyrics_clear();
     lvgl_port_ui_clear_cover();
-    lvgl_port_ui_set_title("DLNA Player");
+    lvgl_port_ui_set_title("Xiaomi Speaker");
     lvgl_port_ui_set_artist("Waiting...");
     /* 字段已清空，后续标题到达时必须补一次歌词抓取 */
     s_lyrics_refetch_pending = true;
@@ -811,7 +811,7 @@ static void consume_miplay_media_events_locked(void)
             lvgl_port_ui_lyrics_clear();
             s_album_art_gen++;
             lvgl_port_ui_clear_cover();
-            lvgl_port_ui_set_title("DLNA Player");
+            lvgl_port_ui_set_title("Xiaomi Speaker");
             lvgl_port_ui_set_artist("Waiting...");
             s_lyrics_ui_clear_pending = false;
             /* 切歌清空后标题可能要等下一个事件才到，置位保证补抓 */
