@@ -414,6 +414,7 @@ esp_miplay-1.85c/
 |------|------|
 | [MYHealer/dlna-esp32](https://github.com/MYHealer/dlna-esp32) | 本项目的 DLNA 前身：纯 DLNA 投屏实现，是本仓库协议层与音频管线的起点 |
 | [MYHealer/airkan-sdk](https://github.com/MYHealer/airkan-sdk) | airkan 遥控 SDK：小米妙享遥控器按键通道的独立实现，本仓库 airkan 部分的对标与参考 |
+| [rosienosiesie/FusionPlay-Android](https://github.com/rosienosiesie/FusionPlay-Android) | Android 端 MiPlay 播放器，本仓库 MiPlay 协议实现的关键参考（音量回控 `volume` 字节格式等即据此对齐） |
 
 ### 第三方组件致谢
 
