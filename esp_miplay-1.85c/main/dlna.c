@@ -857,13 +857,22 @@ static void consume_miplay_media_events_locked(void)
                 s_miplay_position_anchor_us = esp_timer_get_time();
         }
         if (event->changed & MIPLAY_MEDIA_CHANGED_PLAYER_STATE) {
-            int frozen_position = get_miplay_position_ms();
-            s_miplay_state = event->player_state;
-            if (s_miplay_state == PS_PLAYING) {
-                s_miplay_position_anchor_us = esp_timer_get_time();
+            /* 只在状态有效时采纳. 协议层可能给出 MIPLAY_PLAYER_STATE_UNKNOWN(-1),
+             * 直接写入会让 s_miplay_state 落到 -1, 进而被 UI 的 (state != 0)
+             * 判成"播放中", 使屏保永不触发. 无效值保持原状态不变. */
+            if (event->player_state >= PS_STOPPED &&
+                event->player_state <= PS_TRANSITIONING) {
+                int frozen_position = get_miplay_position_ms();
+                s_miplay_state = event->player_state;
+                if (s_miplay_state == PS_PLAYING) {
+                    s_miplay_position_anchor_us = esp_timer_get_time();
+                } else {
+                    if (!event_has_position) s_miplay_position_ms = frozen_position;
+                    s_miplay_position_anchor_us = 0;
+                }
             } else {
-                if (!event_has_position) s_miplay_position_ms = frozen_position;
-                s_miplay_position_anchor_us = 0;
+                ESP_LOGW(TAG, "MiPlay player_state invalid (%d), keep %d",
+                         event->player_state, s_miplay_state);
             }
         }
 
@@ -2561,7 +2570,13 @@ static void ui_update_task(void *arg)
     int tick = 0;
     int last_cur_line = -1;
     while (1) {
-        play_state_t ui_state = s_miplay_connected ? (play_state_t)s_miplay_state : get_state();
+        /* 与下方 display_state 同判据: MiPlay 状态须在有效区间才采信,
+         * 否则回退到本地(DLNA)状态, 避免协议层 UNKNOWN(-1) 污染 UI 状态. */
+        play_state_t ui_state =
+            (s_miplay_connected && s_miplay_state >= PS_STOPPED &&
+             s_miplay_state <= PS_TRANSITIONING)
+                ? (play_state_t)s_miplay_state
+                : get_state();
         /* 空闲态降频到 2Hz，播放态保持 25Hz。
          * 用 TaskNotify 等待：按钮按下时立刻唤醒刷新，不必等满 40ms。
          * 有待发送的音量回控时也保持 40ms，确保尽快发出。 */
@@ -2596,7 +2611,15 @@ static void ui_update_task(void *arg)
             last_cur_line = -1;
         }
 
-        bool miplay_active = s_miplay_connected;
+        /* MiPlay 生效判据: 必须是"连接存在"且"播放状态有效".
+         * 旧实现只看 s_miplay_connected, 而该标志只表示 TCP/协议连接存在,
+         * 与是否在放歌是两个维度: 手机停在投屏页不动时连接仍在, 于是
+         * s_miplay_state 的陈旧值(或协议层 UNKNOWN=-1)被当作有效状态上报,
+         * 使 UI 的 s_playing_state 恒真, 屏保永不触发.
+         * 现在同时要求 s_miplay_state 落在有效区间 [PS_STOPPED, PS_TRANSITIONING]. */
+        bool miplay_state_valid = (s_miplay_state >= PS_STOPPED &&
+                                   s_miplay_state <= PS_TRANSITIONING);
+        bool miplay_active = s_miplay_connected && miplay_state_valid;
         int display_state = miplay_active ? s_miplay_state : (int)get_state();
         int pos_ms = miplay_active ? get_miplay_position_ms() : get_position_ms();
         int pos_sec = pos_ms / 1000;

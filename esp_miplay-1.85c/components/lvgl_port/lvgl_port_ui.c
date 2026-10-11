@@ -277,7 +277,7 @@ static int s_lyrics_prev_line = -1;        /* 上一次的行号，用于检测�
 static bool s_lyrics_visible = false;
 static bool s_cover_ready = false;         /* 封面图片已加载就绪 */
 /* ── 待机时钟：非播放态无触摸超时进入 ── */
-#define STANDBY_IDLE_MS 300000U            /* 5 分钟无操作进入休眠屏保 */
+#define STANDBY_IDLE_MS 120000U            /* 2 分钟无操作进入休眠屏保(锁屏) */
 static uint32_t s_last_touch_tick = 0;     /* 上次触摸时刻（lv_tick） */
 static bool s_playing_state = false;       /* 由 lvgl_port_ui_set_state 维护 */
 static lv_obj_t *s_lyrics_bg_img = NULL; /* 歌词界面背景图 */
@@ -2777,8 +2777,11 @@ static void _animate_citou(int target_angle)
 void lvgl_port_ui_set_state(int state) {
     if (state == s_last_ui_state) return;  /* 状态没变，跳过 */
     s_last_ui_state = state;
-    /* 播放/暂停时不计入待机空闲（暂停算"在用"，仅停止才息屏） */
-    s_playing_state = (state != 0);
+    /* 待机空闲判定: 只有"确实在播放"才阻止息屏.
+     * state 语义: 0=停止 1=播放 2=暂停 3=切歌过渡, 另有 -1=未知(协议层 UNKNOWN).
+     * 旧实现写 (state != 0), 把暂停/过渡/未知全算作"在用", 导致手机停在投屏页
+     * 不发停止事件时 s_miplay_state 长期非 0, 屏保永不触发. 改为白名单判定. */
+    s_playing_state = (state == 1);
     s_last_touch_tick = lv_tick_get();
 
     /* 如果开始播放，退出息屏时钟页面 */
