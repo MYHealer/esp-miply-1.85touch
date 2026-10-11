@@ -404,6 +404,33 @@ esp_miplay-1.85c/
 | 崩溃点 `lv_draw_sw_img.c:322` | 已不再复现。该路径走 transformed 慢路径，`int_largest` 仍为独立 32K 池天花板，高负载下若复现需针对碎片专项分析 |
 | 播放中锁屏 | **设计如此** — 正在播放时不锁屏，避免遮盖封面动画。暂停/停止后 2 分钟锁屏 |
 
+## 参考项目及致谢
+
+本项目建立在多个上游开源工作之上，特此致谢。
+
+### 参考项目
+
+| 项目 | 说明 |
+|------|------|
+| [MYHealer/dlna-esp32](https://github.com/MYHealer/dlna-esp32) | 本项目的 DLNA 前身：纯 DLNA 投屏实现，是本仓库协议层与音频管线的起点 |
+
+### 第三方组件致谢
+
+| 组件 | 作者 / 组织 | 用途 |
+|------|------------|------|
+| [ESP-IDF](https://github.com/espressif/esp-idf) | Espressif Systems | 芯片 SDK 与构建系统 |
+| [ESP-GMF](https://github.com/espressif/esp-gmf) | Espressif Systems | 音频管线框架（`io_http → aud_dec → aud_alc → io_i2s`） |
+| [LVGL](https://github.com/lvgl/lvgl) | LVGL 社区 | 圆屏 UI 渲染（唱片动画 / 歌词 / 状态栏） |
+| [esp-adf-libs](https://github.com/espressif/esp-adf-libs) | Espressif Systems | 音频编解码库（MP3/AAC/WAV/FLAC/OGG） |
+| [libwebp](https://chromium.googlesource.com/webm/libwebp) | Google | 封面 WebP 解码 |
+| [nghttp](https://github.com/nghttp2/nghttp2) | Tatsuhiro Tsujikawa | HTTP/2 客户端（歌词抓取） |
+
+### 协议实现致谢
+
+- **小米妙播（MiPlay）** 与 **airkan 遥控** 的协议细节来自对官方客户端与固件的逆向分析。
+  感谢 [HyperAll](https://github.com/) 等社区项目的反编译工作为 airkan 端口定位提供了关键证据链。
+- 感谢 ESP-GMF 团队在音频管线上游的持续维护，本项目大量依赖其解码与重采样能力。
+
 ## 许可证
 
 MIT
