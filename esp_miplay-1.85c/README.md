@@ -444,4 +444,19 @@ esp_miplay-1.85c/
 
 ## 许可证
 
-MIT
+本项目采用 **[AGPL-3.0](LICENSE)**（GNU Affero General Public License v3.0）许可。
+
+> ⚠️ AGPL-3.0 是**强 Copyleft** 许可：任何修改、分发，**以及通过网络提供服务**的行为，都必须
+> 以同样的 AGPL-3.0 完整开源（第 13 条「Remote Network Interaction」）。闭源商用与售卖均不被允许。
+
+### 第三方组件许可证
+
+本项目使用的第三方组件均为 MIT / BSD 类宽松许可，与 AGPL-3.0 **兼容**（可被 AGPL 项目引用，
+各自仍保留原许可）：
+
+| 组件 | 许可证 |
+|------|--------|
+| ESP-IDF / ESP-GMF / esp-adf-libs | Apache-2.0 / Espressif 改良 MIT |
+| LVGL | MIT |
+| libwebp | BSD-3-Clause |
+| nghttp2 | MIT |
